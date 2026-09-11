@@ -1,5 +1,4 @@
 import { NormalizedMarketCandle } from '../marketData/mexcPublicMarketClient';
-import { candleRepository } from '../marketData/candleRepository';
 import {
   StructurePoint,
   StructurePointType,
@@ -18,11 +17,12 @@ import {
   ALGORITHM_VERSION_V5_REV4,
   ALGORITHM_VERSION_V6,
   ALGORITHM_VERSION_V6_REV2,
+  ALGORITHM_VERSION_V6_REV3,
 } from './structureTypes';
-import { structureRepository } from './structureRepository';
 import { detectStructureV4WarmUpLocked } from './structureV4Engine';
 import { detectStructureV5RangeLocked } from './structureV5Engine';
 import { detectStructureV6FibQualifiedRange } from './structureV6Engine';
+import { detectLegacyPivots } from './legacy/pivotOverlay';
 
 export const STRUCTURE_LOOKBACK_CANDLES = 350;
 export {
@@ -34,6 +34,7 @@ export {
   ALGORITHM_VERSION_V5_REV4,
   ALGORITHM_VERSION_V6,
   ALGORITHM_VERSION_V6_REV2,
+  ALGORITHM_VERSION_V6_REV3,
 };
 
 export class StructureEngine {
@@ -46,7 +47,7 @@ export class StructureEngine {
     candles: NormalizedMarketCandle[],
     customParams?: Partial<StructureParameters>
   ): StructureDetectionResult {
-    const version = customParams?.algorithmVersion;
+    const version = customParams?.algorithmVersion ?? CURRENT_ALGORITHM_VERSION;
     if (version === ALGORITHM_VERSION_V5 || version === ALGORITHM_VERSION_V5_REV4) {
       return this.detectStructureV5RangeLocked(candles, customParams);
     }
@@ -56,16 +57,16 @@ export class StructureEngine {
     if (version === ALGORITHM_VERSION_V3) {
       return this.detectStructureV3LockedCycles(candles, customParams);
     }
-    if (
-      version === ALGORITHM_VERSION_V2 ||
-      (customParams?.initialSeed && !version) ||
-      (customParams?.legacyPivotOverlay && !version) ||
-      (customParams?.lookbackCandles && !customParams?.analysisCandles && !version)
-    ) {
+    if (version === ALGORITHM_VERSION_V2) {
       return this.detectStructureV2(candles, customParams);
     }
-    // Default to STRUCTURE_V6_FIB_QUALIFIED_RANGE
-    return this.detectStructureV6FibQualifiedRange(candles, customParams);
+    if (version === ALGORITHM_VERSION_V6 || version === ALGORITHM_VERSION_V6_REV2 || version === ALGORITHM_VERSION_V6_REV3) {
+      return this.detectStructureV6FibQualifiedRange(candles, {
+        ...customParams,
+        algorithmVersion: version === ALGORITHM_VERSION_V6_REV3 ? version : ALGORITHM_VERSION_V6_REV3,
+      });
+    }
+    throw new Error(`Unsupported structure algorithm version: ${version}`);
   }
 
   /**
@@ -1393,7 +1394,7 @@ export class StructureEngine {
     // Optional legacy pivot comparison
     let legacyPoints: StructurePoint[] | undefined;
     if (params.legacyPivotOverlay) {
-      legacyPoints = this.detectLegacyPivots(workingSet, params);
+      legacyPoints = detectLegacyPivots(workingSet, params);
     }
 
     const stateLabels: Record<StructureState, string> = {
@@ -2336,7 +2337,7 @@ export class StructureEngine {
     // Optional legacy pivot comparison
     let legacyPoints: StructurePoint[] | undefined;
     if (params.legacyPivotOverlay) {
-      legacyPoints = this.detectLegacyPivots(workingSet, params);
+      legacyPoints = detectLegacyPivots(workingSet, params);
     }
 
     const stateLabels: Record<StructureState, string> = {
@@ -2386,68 +2387,6 @@ export class StructureEngine {
   }
 
   /**
-   * Optional legacy 2-bar pivot detection for side-by-side comparison overlay
-   */
-  private detectLegacyPivots(
-    candles: NormalizedMarketCandle[],
-    params: StructureParameters
-  ): StructurePoint[] {
-    const left = params.pivotLeftBars ?? 2;
-    const right = params.pivotRightBars ?? 2;
-    const legacy: StructurePoint[] = [];
-
-    for (let i = left; i < candles.length - right; i++) {
-      const c = candles[i];
-      let isHigh = true;
-      let isLow = true;
-
-      for (let l = 1; l <= left; l++) {
-        if (candles[i - l].high >= c.high) isHigh = false;
-        if (candles[i - l].low <= c.low) isLow = false;
-      }
-      for (let r = 1; r <= right; r++) {
-        if (candles[i + r].high >= c.high) isHigh = false;
-        if (candles[i + r].low <= c.low) isLow = false;
-      }
-
-      if (isHigh) {
-        legacy.push({
-          id: `leg_sh_${c.openTimeUnix}`,
-          symbol: c.symbol,
-          timeframe: c.timeframe,
-          candleOpenTime: c.openTime,
-          candleOpenTimeUnix: c.openTimeUnix,
-          type: StructurePointType.SWING_HIGH,
-          price: c.high,
-          strength: StructureStrength.MINOR,
-          algorithmVersion: 'LEGACY_PIVOT_V1',
-          candleIndex: i,
-          detectedAt: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-        });
-      }
-      if (isLow) {
-        legacy.push({
-          id: `leg_sl_${c.openTimeUnix}`,
-          symbol: c.symbol,
-          timeframe: c.timeframe,
-          candleOpenTime: c.openTime,
-          candleOpenTimeUnix: c.openTimeUnix,
-          type: StructurePointType.SWING_LOW,
-          price: c.low,
-          strength: StructureStrength.MINOR,
-          algorithmVersion: 'LEGACY_PIVOT_V1',
-          candleIndex: i,
-          detectedAt: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-        });
-      }
-    }
-
-    return legacy;
-  }
-
-  /**
    * High-level workflow: retrieve candles from repository, detect structure, and persist.
    */
   public async detectAndSaveStructure(
@@ -2456,10 +2395,15 @@ export class StructureEngine {
     lookback: number = STRUCTURE_LOOKBACK_CANDLES,
     customParams?: Partial<StructureParameters>
   ): Promise<StructureDetectionResult> {
+    const [{ candleRepository }, { structureRepository }] = await Promise.all([
+      import('../marketData/candleRepository'),
+      import('./structureRepository'),
+    ]);
     const candles = await candleRepository.getCandles(symbol, timeframe, lookback + 50);
     const result = this.detectStructure(candles, {
       ...customParams,
       lookbackCandles: lookback,
+      algorithmVersion: customParams?.algorithmVersion ?? CURRENT_ALGORITHM_VERSION,
     });
 
     if (result.points.length > 0) {

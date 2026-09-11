@@ -1,116 +1,128 @@
 import { NormalizedMarketCandle } from '../marketData/mexcPublicMarketClient';
 import {
-  StructurePoint,
-  StructurePointType,
-  StructureStrength,
-  StructureState,
-  StructureParameters,
-  StructureDetectionResult,
-  StructuralRange,
-  StructuralRangeBoundary,
-  TypedStructuralAnchor,
-  BearishRange,
+  ActiveRetracementInfo,
+  ALGORITHM_VERSION_V6_REV3,
   BullishRange,
+  BearishRange,
   createBearishRange,
   createBullishRange,
-  assertBearishRange,
-  assertBullishRange,
-  StructureBreakEvent,
-  ActiveRetracementInfo,
   InitializationStructureResult,
+  StructureBreakEvent,
+  StructureDetectionResult,
   StructureEventLogItem,
-  ALGORITHM_VERSION_V6,
-  ALGORITHM_VERSION_V6_REV2,
+  StructureParameters,
+  StructurePoint,
+  StructurePointType,
+  StructureState,
+  StructureStrength,
+  StructuralRange,
+  TypedStructuralAnchor,
   assertSingleStructureType,
 } from './structureTypes';
 import {
-  StructureDecisionAudit,
-  RejectedStructureEvent,
   CandleReplayStep,
   EngineStateSnapshot,
+  RejectedStructureEvent,
+  StructureDecisionAudit,
 } from './structureAuditTypes';
 
-interface InitialRangeDiscovery {
-  direction: 'BULLISH' | 'BEARISH';
-  topPrice: number;
-  topCandle: NormalizedMarketCandle;
-  topIndex: number;
-  bottomPrice: number;
-  bottomCandle: NormalizedMarketCandle;
-  bottomIndex: number;
+export type V6EngineState =
+  | 'UNINITIALIZED'
+  | 'RANGE_LOCKED_BULLISH'
+  | 'RANGE_LOCKED_BEARISH'
+  | 'EXPANDING_BULLISH'
+  | 'RETRACING_BULLISH'
+  | 'EXPANDING_BEARISH'
+  | 'RETRACING_BEARISH';
+
+type Direction = 'BULLISH' | 'BEARISH';
+
+interface Extreme {
+  price: number;
+  candle: NormalizedMarketCandle;
+  index: number;
+}
+
+interface CandidateLeg {
+  direction: Direction;
+  anchor: TypedStructuralAnchor<StructurePointType>;
+  breakEvent: StructureBreakEvent;
+  breakCandle: NormalizedMarketCandle;
+  extreme: Extreme;
+  retracement: Extreme | null;
+  retracementCandles: number;
+}
+
+interface ProposedTransition {
+  previousRange: StructuralRange;
+  breakEvent: StructureBreakEvent;
+  candidateExtreme: Extreme;
+  retracementExtreme: Extreme;
+  proposedPoints: [StructurePoint, StructurePoint];
+  proposedRange: BullishRange | BearishRange;
+  nextState: 'RANGE_LOCKED_BULLISH' | 'RANGE_LOCKED_BEARISH';
+  retracementCandles: number;
+  fibDepth: number;
+  fibRequiredPrice: number;
+  requiredRetracementCandles: number;
+  requiredRetracementFib: number;
+}
+
+interface InitializationCandidate {
+  direction: Direction;
+  extreme: Extreme;
+  retracement: Extreme;
+  anchorPrice: number;
+  confirmationIndex: number;
+  retracementCandles: number;
+  fibDepth: number;
 }
 
 /**
- * STRUCTURE_V6_FIB_QUALIFIED_RANGE Engine (REV2)
+ * Authoritative external market-structure engine.
  *
- * STRICT EXTERNAL MARKET STRUCTURE ENGINE
- *
- * Core Specification & Invariants:
- * 1. Body-close break of active range boundary begins an expansion candidate leg.
- *    No confirmed structural points are generated upon break.
- * 2. Mandatory Retracement Qualification:
- *    - Minimum retracement candle count (default: 4 candles from candidate extreme).
- *    - Minimum Fibonacci depth (default: 0.382 from active anchor to candidate extreme).
- *    - Wick touching or exceeding 0.382 satisfies Fib requirement.
- * 3. Same-Leg Extension:
- *    - If price makes another extreme in continuation direction before qualifying retracement,
- *      extend candidate extreme and recalculate Fib from anchor.
- * 4. Confirmation:
- *    - ONLY when BOTH candle count >= 4 AND Fib >= 0.382 are satisfied:
- *      Confirm candidate extreme and qualifying intervening anchor.
- *      Lock new range: LH <-> LL or HL <-> HH.
- * 5. Reversals:
- *    - When active LH is broken by candle CLOSE, upward impulse is a Bullish HH candidate.
- *      Fib anchor = previous confirmed LL.
- *    - When active HL is broken by candle CLOSE, downward impulse is a Bearish LL candidate.
- *      Fib anchor = previous confirmed HH.
- * 6. Swing Alternation Invariant:
- *    - LL -> LH -> LL (LH = highest candle high between previous LL and new LL).
- *    - HH -> HL -> HH (HL = lowest candle low between previous HH and new HH).
- * 7. Hard Wick Gate:
- *    - Wick breaches without body close are strictly logged to rejectedEvents and ignored.
- * 8. Clean Chart:
- *    - Confirmed points contain strictly ONE type: HH, HL, LH, or LL.
+ * Breaks are close-only. Fibonacci qualification is wick-based. A qualified
+ * transition is validated and committed as one immutable HH/HL or LL/LH pair.
  */
 export function detectStructureV6FibQualifiedRange(
   allCandles: NormalizedMarketCandle[],
   customParams?: Partial<StructureParameters>
 ): StructureDetectionResult {
-  const startTime = Date.now();
-  const effectiveAlgorithmVersion = customParams?.algorithmVersion ?? ALGORITHM_VERSION_V6_REV2;
-
-  const analysisCandles = Math.max(
-    50,
-    Math.min(1000, customParams?.analysisCandles ?? 280)
-  );
-  const warmUpCandles = Math.max(
+  const started = Date.now();
+  const algorithmVersion = customParams?.algorithmVersion ?? ALGORITHM_VERSION_V6_REV3;
+  const analysisCandles = clamp(customParams?.analysisCandles ?? 280, 50, 1000);
+  const warmUpCandles = clamp(
+    customParams?.initializationSearchCandles ?? customParams?.warmUpCandles ?? 70,
     0,
-    Math.min(200, customParams?.initializationSearchCandles ?? customParams?.warmUpCandles ?? 70)
+    200
   );
-  const minRetracementCandles = Math.max(
-    1,
-    Math.min(20, customParams?.minimumRetracementCandles ?? 4)
-  );
-  const minRetracementFib = Math.max(
-    0.1,
-    Math.min(0.9, customParams?.minimumRetracementFib ?? 0.382)
-  );
+  const minimumRetracementCandles = clamp(customParams?.minimumRetracementCandles ?? 4, 1, 20);
+  const minimumRetracementFib = clamp(customParams?.minimumRetracementFib ?? 0.382, 0.1, 1);
   const lookback = analysisCandles + warmUpCandles;
+  const totalCandlesAvailable = allCandles.length;
+  const unclosedCandleExcluded = allCandles.some((c) => c.isClosed === false);
+  const closed = allCandles.filter((c) => c.isClosed === true);
+  const candles = closed.slice(Math.max(0, closed.length - lookback));
+  const symbol = candles[0]?.symbol ?? allCandles[0]?.symbol ?? 'UNKNOWN';
+  const timeframe = candles[0]?.timeframe ?? allCandles[0]?.timeframe ?? '5M';
+  const parameters: StructureParameters = {
+    analysisCandles,
+    initializationSearchCandles: warmUpCandles,
+    minimumRetracementCandles,
+    minimumRetracementFib,
+    breakConfirmation: 'CLOSE',
+    fibTouchMode: 'WICK',
+    lookbackCandles: lookback,
+    algorithmVersion,
+    legacyPivotOverlay: false,
+    showSequenceNumbers: customParams?.showSequenceNumbers ?? true,
+    manualStart: customParams?.manualStart,
+  };
 
-  // Filter closed candles only
-  const closedCandles = allCandles.filter((c) => c.isClosed !== false);
-  const totalAvailable = closedCandles.length;
-  const startIndex = Math.max(0, totalAvailable - lookback);
-  const evaluationCandles = closedCandles.slice(startIndex);
-
-  if (evaluationCandles.length < 2) {
-    return createEmptyV6Result(startTime, effectiveAlgorithmVersion, minRetracementCandles, minRetracementFib);
+  if (candles.length < 2) {
+    return emptyResult(started, symbol, timeframe, algorithmVersion, parameters, totalCandlesAvailable, unclosedCandleExcluded);
   }
 
-  const mainAnalysisStartIndex = Math.min(warmUpCandles, evaluationCandles.length - 1);
-  const mainStartTimeStr = evaluationCandles[mainAnalysisStartIndex]?.openTime ?? null;
-
-  // Output containers
   const points: StructurePoint[] = [];
   const ranges: StructuralRange[] = [];
   const breakEvents: StructureBreakEvent[] = [];
@@ -118,1086 +130,204 @@ export function detectStructureV6FibQualifiedRange(
   const audits: StructureDecisionAudit[] = [];
   const rejectedEvents: RejectedStructureEvent[] = [];
   const candleReplaySteps: CandleReplayStep[] = [];
-
-  let rangeSequenceIndex = 0;
+  let engineState: V6EngineState = 'UNINITIALIZED';
   let activeRange: StructuralRange | null = null;
-  let currentState: StructureState = StructureState.UNDEFINED;
-
-  // Phase tracking
-  let currentPhase: 'RANGE_LOCKED' | 'EXPANSION_CANDIDATE' = 'RANGE_LOCKED';
-
-  // Candidate leg state
-  let candidateExtremeType: StructurePointType | null = null;
-  let candidateExtremePrice = 0;
-  let candidateExtremeCandle: NormalizedMarketCandle | null = null;
-  let candidateExtremeIndex = -1;
-
-  // Fib anchor state
-  let fibAnchorPrice = 0;
-  let fibAnchorCandle: NormalizedMarketCandle | StructuralRangeBoundary | null = null;
-  let fibAnchorLabel = '';
-
-  // Retracement tracking state
-  let retracementExtremePrice = 0;
-  let retracementExtremeCandle: NormalizedMarketCandle | null = null;
-  let retracementExtremeIndex = -1;
-
-  // Active confirmed anchors
-  let lastConfirmedLHPoint: StructurePoint | null = null;
-  let lastConfirmedHLPoint: StructurePoint | null = null;
-  let lastConfirmedLLPoint: StructurePoint | null = null;
-  let lastConfirmedHHPoint: StructurePoint | null = null;
-
-  // ==========================================
-  // INITIALIZATION / SEEDING
-  // ==========================================
+  let candidate: CandidateLeg | null = null;
+  let sequence = 0;
+  let loopStart = 0;
+  const warmUpCount = Math.min(warmUpCandles, candles.length);
   const initializationLogs: string[] = [];
-  let initResult: InitializationStructureResult;
 
   if (customParams?.manualStart) {
-    const ms = customParams.manualStart;
-    initializationLogs.push(`MANUAL INITIALIZATION: Seeding ${ms.direction} starting structure.`);
-    rangeSequenceIndex++;
-    const rangeId = `${ms.direction}_RANGE_${rangeSequenceIndex}`;
-
-    if (ms.direction === 'BEARISH') {
-      const lhAnchor: TypedStructuralAnchor<StructurePointType.LH> = {
-        type: StructurePointType.LH,
-        price: ms.top.price,
-        candleTime: ms.top.candleTime,
-        candleTimeUnix: ms.top.candleTimeUnix ?? new Date(ms.top.candleTime).getTime(),
-        candleIndex: ms.top.candleIndex ?? 0,
-        label: `LH${rangeSequenceIndex}`,
-        rangeId,
-      };
-      const llAnchor: TypedStructuralAnchor<StructurePointType.LL> = {
-        type: StructurePointType.LL,
-        price: ms.bottom.price,
-        candleTime: ms.bottom.candleTime,
-        candleTimeUnix: ms.bottom.candleTimeUnix ?? new Date(ms.bottom.candleTime).getTime(),
-        candleIndex: ms.bottom.candleIndex ?? 1,
-        label: `LL${rangeSequenceIndex}`,
-        rangeId,
-      };
-      activeRange = createBearishRange(lhAnchor, llAnchor, rangeId, rangeSequenceIndex);
-      currentState = StructureState.BEARISH;
-
-      const p1 = createPointFromBoundary(lhAnchor, rangeId, 'BEARISH', true, false, effectiveAlgorithmVersion);
-      const p2 = createPointFromBoundary(llAnchor, rangeId, 'BEARISH', false, true, effectiveAlgorithmVersion);
-      points.push(p1, p2);
-      lastConfirmedLHPoint = p1;
-      lastConfirmedLLPoint = p2;
-    } else {
-      const hhAnchor: TypedStructuralAnchor<StructurePointType.HH> = {
-        type: StructurePointType.HH,
-        price: ms.top.price,
-        candleTime: ms.top.candleTime,
-        candleTimeUnix: ms.top.candleTimeUnix ?? new Date(ms.top.candleTime).getTime(),
-        candleIndex: ms.top.candleIndex ?? 0,
-        label: `HH${rangeSequenceIndex}`,
-        rangeId,
-      };
-      const hlAnchor: TypedStructuralAnchor<StructurePointType.HL> = {
-        type: StructurePointType.HL,
-        price: ms.bottom.price,
-        candleTime: ms.bottom.candleTime,
-        candleTimeUnix: ms.bottom.candleTimeUnix ?? new Date(ms.bottom.candleTime).getTime(),
-        candleIndex: ms.bottom.candleIndex ?? 1,
-        label: `HL${rangeSequenceIndex}`,
-        rangeId,
-      };
-      activeRange = createBullishRange(hhAnchor, hlAnchor, rangeId, rangeSequenceIndex);
-      currentState = StructureState.BULLISH;
-
-      const p1 = createPointFromBoundary(hhAnchor, rangeId, 'BULLISH', true, false, effectiveAlgorithmVersion);
-      const p2 = createPointFromBoundary(hlAnchor, rangeId, 'BULLISH', false, true, effectiveAlgorithmVersion);
-      points.push(p1, p2);
-      lastConfirmedHHPoint = p1;
-      lastConfirmedHLPoint = p2;
-    }
-    ranges.push(activeRange);
-    initResult = {
-      initialState: currentState,
-      initialSequence: currentState === StructureState.BEARISH ? 'LH → LL' : 'HL → HH',
-      warmUpCandlesUsed: 0,
-      usedWarmUp: false,
-      initialTrend: currentState,
-      candlesEvaluated: evaluationCandles.length,
-      warmUpCandlesCount: 0,
-      initialFoundAt: activeRange.top.candleTime,
-      initialFoundTimeUnix: activeRange.top.candleTimeUnix,
-      initialLH: activeRange.direction === 'BEARISH' ? activeRange.top.price : null,
-      initialLL: activeRange.direction === 'BEARISH' ? activeRange.bottom.price : null,
-      initialHH: activeRange.direction === 'BULLISH' ? activeRange.top.price : null,
-      initialHL: activeRange.direction === 'BULLISH' ? activeRange.bottom.price : null,
-      warmUpStartIndex: 0,
-      mainAnalysisStartIndex: 0,
-      mainAnalysisStartTime: evaluationCandles[0]?.openTime ?? null,
-      warmUpCandlesMax: 0,
-      initializationLogs,
-    };
+    sequence = 1;
+    const seed = seedManualRange(customParams.manualStart, candles, symbol, timeframe, algorithmVersion, sequence);
+    activeRange = seed.range;
+    points.push(...seed.points);
+    ranges.push(seed.range);
+    engineState = seed.range.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH';
+    loopStart = Math.max(0, Math.max(seed.range.top.candleIndex ?? 0, seed.range.bottom.candleIndex ?? 0) + 1);
+    initializationLogs.push(`Manual ${seed.range.direction} range accepted.`);
   } else {
-    // Standard Warm-Up Initial External Range Discovery
-    const warmUpSlice = evaluationCandles.slice(0, warmUpCandles > 0 ? warmUpCandles : 30);
-    const discovered = discoverInitialExternalRange(warmUpSlice);
-
-    if (discovered) {
-      rangeSequenceIndex++;
-      const rangeId = `${discovered.direction}_RANGE_${rangeSequenceIndex}`;
-      initializationLogs.push(
-        `Discovered ${discovered.direction} starting range: Top=${discovered.topPrice.toFixed(2)} (${discovered.topCandle.openTime}), Bottom=${discovered.bottomPrice.toFixed(2)} (${discovered.bottomCandle.openTime}).`
+    const initialization = findNearestQualifiedWarmUpCycle(
+      candles.slice(0, warmUpCount),
+      minimumRetracementCandles,
+      minimumRetracementFib
+    );
+    if (initialization) {
+      sequence = 1;
+      const seed = createQualifiedPair(
+        initialization.direction,
+        initialization.extreme,
+        initialization.retracement,
+        symbol,
+        timeframe,
+        algorithmVersion,
+        sequence,
+        initialization.retracementCandles,
+        initialization.fibDepth,
+        true
       );
-
-      if (discovered.direction === 'BEARISH') {
-        const lhAnchor: TypedStructuralAnchor<StructurePointType.LH> = {
-          type: StructurePointType.LH,
-          price: discovered.topPrice,
-          candleTime: discovered.topCandle.openTime,
-          candleTimeUnix: discovered.topCandle.openTimeUnix,
-          candleIndex: discovered.topIndex,
-          label: `LH${rangeSequenceIndex}`,
-          rangeId,
-        };
-        const llAnchor: TypedStructuralAnchor<StructurePointType.LL> = {
-          type: StructurePointType.LL,
-          price: discovered.bottomPrice,
-          candleTime: discovered.bottomCandle.openTime,
-          candleTimeUnix: discovered.bottomCandle.openTimeUnix,
-          candleIndex: discovered.bottomIndex,
-          label: `LL${rangeSequenceIndex}`,
-          rangeId,
-        };
-        activeRange = createBearishRange(lhAnchor, llAnchor, rangeId, rangeSequenceIndex);
-        currentState = StructureState.BEARISH;
-
-        const p1 = createPointFromBoundary(lhAnchor, rangeId, 'BEARISH', true, false, effectiveAlgorithmVersion);
-        const p2 = createPointFromBoundary(llAnchor, rangeId, 'BEARISH', false, true, effectiveAlgorithmVersion);
-        p1.isWarmUpAnchor = true;
-        p2.isWarmUpAnchor = true;
-        points.push(p1, p2);
-        lastConfirmedLHPoint = p1;
-        lastConfirmedLLPoint = p2;
-      } else {
-        const hhAnchor: TypedStructuralAnchor<StructurePointType.HH> = {
-          type: StructurePointType.HH,
-          price: discovered.topPrice,
-          candleTime: discovered.topCandle.openTime,
-          candleTimeUnix: discovered.topCandle.openTimeUnix,
-          candleIndex: discovered.topIndex,
-          label: `HH${rangeSequenceIndex}`,
-          rangeId,
-        };
-        const hlAnchor: TypedStructuralAnchor<StructurePointType.HL> = {
-          type: StructurePointType.HL,
-          price: discovered.bottomPrice,
-          candleTime: discovered.bottomCandle.openTime,
-          candleTimeUnix: discovered.bottomCandle.openTimeUnix,
-          candleIndex: discovered.bottomIndex,
-          label: `HL${rangeSequenceIndex}`,
-          rangeId,
-        };
-        activeRange = createBullishRange(hhAnchor, hlAnchor, rangeId, rangeSequenceIndex);
-        currentState = StructureState.BULLISH;
-
-        const p1 = createPointFromBoundary(hhAnchor, rangeId, 'BULLISH', true, false, effectiveAlgorithmVersion);
-        const p2 = createPointFromBoundary(hlAnchor, rangeId, 'BULLISH', false, true, effectiveAlgorithmVersion);
-        p1.isWarmUpAnchor = true;
-        p2.isWarmUpAnchor = true;
-        points.push(p1, p2);
-        lastConfirmedHHPoint = p1;
-        lastConfirmedHLPoint = p2;
-      }
-      ranges.push(activeRange);
-      initResult = {
-        initialState: currentState,
-        initialSequence: currentState === StructureState.BEARISH ? 'LH → LL' : 'HL → HH',
-        warmUpCandlesUsed: warmUpSlice.length,
-        usedWarmUp: true,
-        initialTrend: currentState,
-        candlesEvaluated: evaluationCandles.length,
-        warmUpCandlesCount: warmUpSlice.length,
-        initialFoundAt: activeRange.top.candleTime,
-        initialFoundTimeUnix: activeRange.top.candleTimeUnix,
-        initialLH: activeRange.direction === 'BEARISH' ? activeRange.top.price : null,
-        initialLL: activeRange.direction === 'BEARISH' ? activeRange.bottom.price : null,
-        initialHH: activeRange.direction === 'BULLISH' ? activeRange.top.price : null,
-        initialHL: activeRange.direction === 'BULLISH' ? activeRange.bottom.price : null,
-        warmUpStartIndex: 0,
-        mainAnalysisStartIndex,
-        mainAnalysisStartTime: mainStartTimeStr,
-        warmUpCandlesMax: warmUpCandles,
-        initializationLogs,
-      };
+      activeRange = seed.range;
+      points.push(...seed.points);
+      ranges.push(seed.range);
+      engineState = initialization.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH';
+      loopStart = initialization.confirmationIndex + 1;
+      initializationLogs.push(`Nearest qualified ${initialization.direction} warm-up cycle confirmed.`);
     } else {
-      initResult = {
-        initialState: StructureState.UNDEFINED,
-        initialSequence: 'NONE',
-        warmUpCandlesUsed: 0,
-        usedWarmUp: false,
-        initialTrend: StructureState.UNDEFINED,
-        candlesEvaluated: evaluationCandles.length,
-        warmUpCandlesCount: 0,
-        initialFoundAt: null,
-        initialFoundTimeUnix: null,
-        initialLH: null,
-        initialLL: null,
-        initialHH: null,
-        initialHL: null,
-        warmUpStartIndex: 0,
-        mainAnalysisStartIndex,
-        mainAnalysisStartTime: mainStartTimeStr,
-        warmUpCandlesMax: warmUpCandles,
-        initializationLogs,
-      };
+      loopStart = warmUpCount;
+      initializationLogs.push('No qualified prior cycle found; engine remains UNINITIALIZED.');
     }
   }
 
-  // Determine loop start: process candles following the initial anchor formations
-  const initialAnchorMaxIdx = activeRange
-    ? Math.max(activeRange.top.candleIndex ?? 0, activeRange.bottom.candleIndex ?? 0)
-    : 0;
-  const loopStart = Math.max(1, initialAnchorMaxIdx + 1);
+  const initialization: InitializationStructureResult = {
+    initialState: toPublicState(engineState),
+    initialSequence: activeRange?.direction === 'BULLISH' ? 'HL → HH' : activeRange ? 'LH → LL' : 'NONE',
+    warmUpCandlesUsed: customParams?.manualStart ? 0 : warmUpCount,
+    warmUpCandlesMax: warmUpCandles,
+    initialFoundAt: activeRange?.top.candleTime ?? null,
+    initialFoundTimeUnix: activeRange?.top.candleTimeUnix ?? null,
+    initialLH: activeRange?.direction === 'BEARISH' ? activeRange.top.price : null,
+    initialLL: activeRange?.direction === 'BEARISH' ? activeRange.bottom.price : null,
+    initialHH: activeRange?.direction === 'BULLISH' ? activeRange.top.price : null,
+    initialHL: activeRange?.direction === 'BULLISH' ? activeRange.bottom.price : null,
+    warmUpStartIndex: 0,
+    mainAnalysisStartIndex: warmUpCount,
+    mainAnalysisStartTime: candles[warmUpCount]?.openTime ?? null,
+    initializationLogs,
+    usedWarmUp: !customParams?.manualStart && !!activeRange,
+    initialTrend: toPublicState(engineState),
+    candlesEvaluated: candles.length,
+    warmUpCandlesCount: warmUpCount,
+  };
 
-  // Fill replay steps for warm-up candles
-  for (let w = 0; w < loopStart; w++) {
-    const c = evaluationCandles[w];
-    recordStep(
-      candleReplaySteps,
-      w,
-      c,
-      currentState,
-      currentPhase,
-      activeRange,
-      ['Warm-up initialization range setup.'],
-      null,
-      null
-    );
+  for (let i = 0; i < loopStart && i < candles.length; i++) {
+    recordReplay(candleReplaySteps, i, candles[i], engineState, activeRange, ['Warm-up evaluation.'], null, null);
   }
 
-  // ==========================================
-  // MAIN ANALYSIS LOOP (Chronological, 1 pass)
-  // ==========================================
-  for (let i = loopStart; i < evaluationCandles.length; i++) {
-    const candle = evaluationCandles[i];
-    const decisionTrace: string[] = [];
-    let breakIdThisCandle: string | null = null;
-    let pointCreatedThisCandle: string | null = null;
+  for (let i = loopStart; i < candles.length; i++) {
+    const candle = candles[i];
+    const trace: string[] = [];
+    let breakThisCandle: string | null = null;
+    let confirmedThisCandle: string | null = null;
 
-    if (!activeRange) {
-      // Fallback if no initial range could be locked
-      recordStep(
-        candleReplaySteps,
-        i,
-        candle,
-        currentState,
-        currentPhase,
-        null,
-        ['Awaiting initial external range discovery.'],
-        null,
-        null
-      );
+    if (engineState === 'UNINITIALIZED') {
+      trace.push('No qualified seed range; external structure is undefined.');
+      recordReplay(candleReplaySteps, i, candle, engineState, null, trace, null, null);
       continue;
     }
 
-    // ----------------------------------------------------
-    // PHASE 1: RANGE_LOCKED
-    // ----------------------------------------------------
-    if (currentPhase === 'RANGE_LOCKED') {
-      if (activeRange.direction === 'BEARISH') {
-        const activeLH = activeRange.top.price;
-        const activeLL = activeRange.bottom.price;
-
-        // Continuation Break (close < activeLL)
-        if (candle.close < activeLL) {
-          const breakId = `break_bear_cont_${activeRange.rangeId}_${candle.openTimeUnix}`;
-          breakIdThisCandle = breakId;
-          decisionTrace.push(
-            `BEARISH CONTINUATION BREAK: Candle closed at ${candle.close.toFixed(2)} < active LL (${activeLL.toFixed(2)}).`
-          );
-
-          breakEvents.push({
-            id: breakId,
-            candleTime: candle.openTime,
-            candleTimeUnix: candle.openTimeUnix,
-            candleIndex: i,
-            price: candle.close,
-            brokenLevel: activeLL,
-            breakType: 'BEARISH_CONTINUATION',
-            label: `BEARISH CONTINUATION (${activeRange.bottom.label})`,
-            regimeId: activeRange.rangeId,
-          });
-
-          activeRange.status = 'BROKEN_CONTINUATION';
-          activeRange.endedAt = candle.openTime;
-          activeRange.endedAtUnix = candle.openTimeUnix;
-          activeRange.breakEventId = breakId;
-          activeRange.breakCandleTime = candle.openTime;
-          activeRange.breakCandleClose = candle.close;
-
-          currentPhase = 'EXPANSION_CANDIDATE';
-          candidateExtremeType = StructurePointType.LL;
-          candidateExtremePrice = candle.low;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-
-          fibAnchorPrice = activeRange.top.price;
-          fibAnchorCandle = activeRange.top;
-          fibAnchorLabel = activeRange.top.label;
-
-          retracementExtremePrice = -Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Reversal Break (close > activeLH)
-        else if (candle.close > activeLH) {
-          const breakId = `break_bear_rev_${activeRange.rangeId}_${candle.openTimeUnix}`;
-          breakIdThisCandle = breakId;
-          decisionTrace.push(
-            `BULLISH REVERSAL BREAK: Candle closed at ${candle.close.toFixed(2)} > active LH (${activeLH.toFixed(2)}).`
-          );
-
-          breakEvents.push({
-            id: breakId,
-            candleTime: candle.openTime,
-            candleTimeUnix: candle.openTimeUnix,
-            candleIndex: i,
-            price: candle.close,
-            brokenLevel: activeLH,
-            breakType: 'BEARISH_STRUCTURE_BROKEN',
-            label: `BEARISH BROKEN (${activeRange.top.label})`,
-            regimeId: activeRange.rangeId,
-          });
-
-          activeRange.status = 'BROKEN_REVERSAL';
-          activeRange.endedAt = candle.openTime;
-          activeRange.endedAtUnix = candle.openTimeUnix;
-          activeRange.breakEventId = breakId;
-          activeRange.breakCandleTime = candle.openTime;
-          activeRange.breakCandleClose = candle.close;
-
-          // Reversal to Bullish Expansion Candidate
-          currentPhase = 'EXPANSION_CANDIDATE';
-          candidateExtremeType = StructurePointType.HH;
-          candidateExtremePrice = candle.high;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-
-          // Anchor for Bullish Reversal = previous confirmed LL
-          fibAnchorPrice = activeRange.bottom.price;
-          fibAnchorCandle = activeRange.bottom;
-          fibAnchorLabel = activeRange.bottom.label;
-
-          retracementExtremePrice = Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Wick breach checks (Logged to rejected events)
-        else {
-          if (candle.low < activeLL) {
-            recordWickRejection(
-              rejectedEvents,
-              candle,
-              i,
-              activeLL,
-              candle.low,
-              activeRange.rangeId,
-              'REJECTED_LOW',
-              `Wick touched ${candle.low.toFixed(2)} < LL ${activeLL.toFixed(2)}, but close ${candle.close.toFixed(2)} remained inside.`
-            );
-          }
-          if (candle.high > activeLH) {
-            recordWickRejection(
-              rejectedEvents,
-              candle,
-              i,
-              activeLH,
-              candle.high,
-              activeRange.rangeId,
-              'REJECTED_HIGH',
-              `Wick touched ${candle.high.toFixed(2)} > LH ${activeLH.toFixed(2)}, but close ${candle.close.toFixed(2)} remained inside.`
-            );
-          }
-          decisionTrace.push('Internal price action: candle inside locked bearish range boundaries.');
-        }
+    if (engineState === 'RANGE_LOCKED_BULLISH' || engineState === 'RANGE_LOCKED_BEARISH') {
+      if (!activeRange || activeRange.status !== 'ACTIVE') {
+        throw new Error('V6 invariant failure: locked state requires exactly one active range.');
+      }
+      const breakResult = detectBreak(activeRange, candle, i, rejectedEvents);
+      if (breakResult) {
+        candidate = breakResult.candidate;
+        breakEvents.push(breakResult.event);
+        breakThisCandle = breakResult.event.id ?? null;
+        engineState = candidate.direction === 'BULLISH' ? 'EXPANDING_BULLISH' : 'EXPANDING_BEARISH';
+        trace.push(`${breakResult.event.breakType}: closed at ${candle.close}.`);
+        eventLogs.push(logItem(candle, 'STRUCTURE_BROKEN', 'Body-close structure break', trace[trace.length - 1]));
       } else {
-        // Bullish Range Active
-        const activeHH = activeRange.top.price;
-        const activeHL = activeRange.bottom.price;
-
-        // Continuation Break (close > activeHH)
-        if (candle.close > activeHH) {
-          const breakId = `break_bull_cont_${activeRange.rangeId}_${candle.openTimeUnix}`;
-          breakIdThisCandle = breakId;
-          decisionTrace.push(
-            `BULLISH CONTINUATION BREAK: Candle closed at ${candle.close.toFixed(2)} > active HH (${activeHH.toFixed(2)}).`
-          );
-
-          breakEvents.push({
-            id: breakId,
-            candleTime: candle.openTime,
-            candleTimeUnix: candle.openTimeUnix,
-            candleIndex: i,
-            price: candle.close,
-            brokenLevel: activeHH,
-            breakType: 'BULLISH_CONTINUATION',
-            label: `BULLISH CONTINUATION (${activeRange.top.label})`,
-            regimeId: activeRange.rangeId,
-          });
-
-          activeRange.status = 'BROKEN_CONTINUATION';
-          activeRange.endedAt = candle.openTime;
-          activeRange.endedAtUnix = candle.openTimeUnix;
-          activeRange.breakEventId = breakId;
-          activeRange.breakCandleTime = candle.openTime;
-          activeRange.breakCandleClose = candle.close;
-
-          currentPhase = 'EXPANSION_CANDIDATE';
-          candidateExtremeType = StructurePointType.HH;
-          candidateExtremePrice = candle.high;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-
-          fibAnchorPrice = activeRange.bottom.price;
-          fibAnchorCandle = activeRange.bottom;
-          fibAnchorLabel = activeRange.bottom.label;
-
-          retracementExtremePrice = Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Reversal Break (close < activeHL)
-        else if (candle.close < activeHL) {
-          const breakId = `break_bull_rev_${activeRange.rangeId}_${candle.openTimeUnix}`;
-          breakIdThisCandle = breakId;
-          decisionTrace.push(
-            `BEARISH REVERSAL BREAK: Candle closed at ${candle.close.toFixed(2)} < active HL (${activeHL.toFixed(2)}).`
-          );
-
-          breakEvents.push({
-            id: breakId,
-            candleTime: candle.openTime,
-            candleTimeUnix: candle.openTimeUnix,
-            candleIndex: i,
-            price: candle.close,
-            brokenLevel: activeHL,
-            breakType: 'BULLISH_STRUCTURE_BROKEN',
-            label: `BULLISH BROKEN (${activeRange.bottom.label})`,
-            regimeId: activeRange.rangeId,
-          });
-
-          activeRange.status = 'BROKEN_REVERSAL';
-          activeRange.endedAt = candle.openTime;
-          activeRange.endedAtUnix = candle.openTimeUnix;
-          activeRange.breakEventId = breakId;
-          activeRange.breakCandleTime = candle.openTime;
-          activeRange.breakCandleClose = candle.close;
-
-          // Reversal to Bearish Expansion Candidate
-          currentPhase = 'EXPANSION_CANDIDATE';
-          candidateExtremeType = StructurePointType.LL;
-          candidateExtremePrice = candle.low;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-
-          // Anchor for Bearish Reversal = previous confirmed HH
-          fibAnchorPrice = activeRange.top.price;
-          fibAnchorCandle = activeRange.top;
-          fibAnchorLabel = activeRange.top.label;
-
-          retracementExtremePrice = -Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Wick breach checks
-        else {
-          if (candle.high > activeHH) {
-            recordWickRejection(
-              rejectedEvents,
-              candle,
-              i,
-              activeHH,
-              candle.high,
-              activeRange.rangeId,
-              'REJECTED_HIGH',
-              `Wick touched ${candle.high.toFixed(2)} > HH ${activeHH.toFixed(2)}, but close ${candle.close.toFixed(2)} remained inside.`
-            );
-          }
-          if (candle.low < activeHL) {
-            recordWickRejection(
-              rejectedEvents,
-              candle,
-              i,
-              activeHL,
-              candle.low,
-              activeRange.rangeId,
-              'REJECTED_LOW',
-              `Wick touched ${candle.low.toFixed(2)} < HL ${activeHL.toFixed(2)}, but close ${candle.close.toFixed(2)} remained inside.`
-            );
-          }
-          decisionTrace.push('Internal price action: candle inside locked bullish range boundaries.');
-        }
+        trace.push('Internal price action ignored inside the active external range.');
       }
-    }
-    // ----------------------------------------------------
-    // PHASE 2: EXPANSION_CANDIDATE
-    // ----------------------------------------------------
-    else if (currentPhase === 'EXPANSION_CANDIDATE') {
-      if (candidateExtremeType === StructurePointType.LL) {
-        // Check opposing reversal break above fibAnchorPrice
-        if (candle.close > fibAnchorPrice) {
-          decisionTrace.push(
-            `OPPOSING REVERSAL: Close ${candle.close.toFixed(2)} > anchor ${fibAnchorPrice.toFixed(2)}. Aborting bearish leg.`
+    } else {
+      if (!candidate || !activeRange) {
+        throw new Error('V6 invariant failure: expansion/retracement state requires a candidate and range.');
+      }
+      const extended = extendCandidate(candidate, candle, i);
+      if (extended) {
+        engineState = candidate.direction === 'BULLISH' ? 'EXPANDING_BULLISH' : 'EXPANDING_BEARISH';
+        trace.push(`Same-leg ${candidate.direction} extreme extended to ${candidate.extreme.price}.`);
+        eventLogs.push(logItem(candle, 'LEG_EXTENDED', 'Candidate extended', trace[trace.length - 1]));
+      } else {
+        updateRetracement(candidate, candle, i);
+        engineState = candidate.direction === 'BULLISH' ? 'RETRACING_BULLISH' : 'RETRACING_BEARISH';
+        const qualification = qualify(candidate, minimumRetracementCandles, minimumRetracementFib);
+        trace.push(
+          `Retracement ${qualification.candleCount}/${minimumRetracementCandles} candles, ${(qualification.fibDepth * 100).toFixed(1)}%/${(minimumRetracementFib * 100).toFixed(1)}% Fib.`
+        );
+        if (qualification.candleQualified && qualification.fibQualified && candidate.retracement) {
+          const proposed = proposeTransition(
+            activeRange,
+            candidate,
+            candidate.retracement,
+            symbol,
+            timeframe,
+            algorithmVersion,
+            sequence + 1,
+            qualification
           );
-          candidateExtremeType = StructurePointType.HH;
-          fibAnchorPrice = candidateExtremePrice;
-          candidateExtremePrice = candle.high;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-          retracementExtremePrice = Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Same-leg extension downward
-        else if (candle.low < candidateExtremePrice) {
-          candidateExtremePrice = candle.low;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-          retracementExtremePrice = -Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-          decisionTrace.push(
-            `SAME-LEG EXTENSION: Candidate LL extended to ${candle.low.toFixed(2)}. Reset retracement tracking.`
-          );
-        }
-        // Retracement tracking
-        else {
-          if (candle.high > retracementExtremePrice) {
-            retracementExtremePrice = candle.high;
-            retracementExtremeCandle = candle;
-            retracementExtremeIndex = i;
-          }
-          const retracementCandles = i - candidateExtremeIndex;
-          const fibRange = Math.max(1e-6, fibAnchorPrice - candidateExtremePrice);
-          const fibRequiredPrice = candidateExtremePrice + minRetracementFib * fibRange;
-          const actualFibDepth = (retracementExtremePrice - candidateExtremePrice) / fibRange;
-          const isFibQualified = retracementExtremePrice >= fibRequiredPrice;
-          const isCandleCountQualified = retracementCandles >= minRetracementCandles;
+          validateTransition(proposed, candle, symbol, timeframe, ranges);
 
-          decisionTrace.push(
-            `RETRACEMENT: Peak=${retracementExtremePrice.toFixed(2)}, Candles=${retracementCandles}/${minRetracementCandles}, Fib=${(actualFibDepth * 100).toFixed(1)}%/${(minRetracementFib * 100).toFixed(1)}%.`
-          );
-
-          if (isFibQualified && isCandleCountQualified) {
-            // CONFIRM BEARISH STRUCTURAL CYCLE
-            rangeSequenceIndex++;
-            const newRangeId = `BEARISH_RANGE_${rangeSequenceIndex}`;
-            decisionTrace.push(
-              `CONFIRMED BEARISH CYCLE: Both candle count (${retracementCandles}) and Fib (${(actualFibDepth * 100).toFixed(1)}%) qualified!`
-            );
-
-            // Invariant: Never allow LL -> LL without an LH.
-            // When a new LL confirms, set LH = HIGHEST candle HIGH between previous LL and new LL.
-            const prevLLIdx = activeRange.bottom.candleIndex ?? 0;
-            let highestBetween = -Infinity;
-            let highestCandleBetween: NormalizedMarketCandle | null = null;
-            let highestIdxBetween = -1;
-
-            for (let k = prevLLIdx; k <= candidateExtremeIndex; k++) {
-              const kc = evaluationCandles[k];
-              if (kc && kc.high > highestBetween) {
-                highestBetween = kc.high;
-                highestCandleBetween = kc;
-                highestIdxBetween = k;
-              }
-            }
-
-            if (
-              highestCandleBetween &&
-              highestIdxBetween > prevLLIdx &&
-              highestIdxBetween < candidateExtremeIndex
-            ) {
-              const interveningLH: StructurePoint = {
-                id: `v6_LH_${rangeSequenceIndex}_${highestCandleBetween.openTimeUnix}`,
-                eventId: `v6_LH_${rangeSequenceIndex}_${highestCandleBetween.openTimeUnix}`,
-                symbol: candle.symbol,
-                timeframe: candle.timeframe,
-                candleOpenTime: highestCandleBetween.openTime,
-                candleOpenTimeUnix: highestCandleBetween.openTimeUnix,
-                candleIndex: highestIdxBetween,
-                type: StructurePointType.LH,
-                price: highestBetween,
-                strength: StructureStrength.MAJOR,
-                algorithmVersion: effectiveAlgorithmVersion,
-                rangeId: newRangeId,
-                sequenceLabel: `LH${rangeSequenceIndex}`,
-                sequenceIndex: rangeSequenceIndex,
-                isRangeTop: true,
-                isRangeBottom: false,
-                confirmed: true,
-                structureScope: 'EXTERNAL',
-                confirmationReason: `Highest candle HIGH (${highestBetween.toFixed(2)}) between previous LL and new LL enforcing global swing alternation.`,
-                detectedAt: new Date().toISOString(),
-                createdAt: new Date().toISOString(),
-              };
-              points.push(interveningLH);
-              lastConfirmedLHPoint = interveningLH;
-            }
-
-            // Confirmed LL
-            const confirmedLL: StructurePoint = {
-              id: `v6_LL_${rangeSequenceIndex}_${candidateExtremeCandle!.openTimeUnix}`,
-              eventId: `v6_LL_${rangeSequenceIndex}_${candidateExtremeCandle!.openTimeUnix}`,
-              symbol: candle.symbol,
-              timeframe: candle.timeframe,
-              candleOpenTime: candidateExtremeCandle!.openTime,
-              candleOpenTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candleIndex: candidateExtremeIndex,
-              type: StructurePointType.LL,
-              price: candidateExtremePrice,
-              strength: StructureStrength.MAJOR,
-              algorithmVersion: effectiveAlgorithmVersion,
-              rangeId: newRangeId,
-              sequenceLabel: `LL${rangeSequenceIndex}`,
-              sequenceIndex: rangeSequenceIndex,
-              isRangeBottom: true,
-              isRangeTop: false,
-              confirmed: true,
-              structureScope: 'EXTERNAL',
-              confirmationReason: `Expansion low (${candidateExtremePrice.toFixed(2)}) qualified by subsequent retracement (${retracementCandles} candles, ${(actualFibDepth * 100).toFixed(1)}% Fib).`,
-              detectedAt: new Date().toISOString(),
-              createdAt: new Date().toISOString(),
-            };
-            points.push(confirmedLL);
-            lastConfirmedLLPoint = confirmedLL;
-            pointCreatedThisCandle = confirmedLL.id;
-
-            // Lock new Bearish Range
-            const lockTopPrice = highestBetween > -Infinity ? highestBetween : retracementExtremePrice;
-            const lockTopCandle = highestCandleBetween ?? retracementExtremeCandle!;
-            const lockTopIdx = highestIdxBetween >= 0 ? highestIdxBetween : retracementExtremeIndex;
-
-            const lhAnchor: TypedStructuralAnchor<StructurePointType.LH> = {
-              type: StructurePointType.LH,
-              price: lockTopPrice,
-              candleTime: lockTopCandle.openTime,
-              candleTimeUnix: lockTopCandle.openTimeUnix,
-              candleIndex: lockTopIdx,
-              label: `LH${rangeSequenceIndex}`,
-              rangeId: newRangeId,
-            };
-            const llAnchor: TypedStructuralAnchor<StructurePointType.LL> = {
-              type: StructurePointType.LL,
-              price: candidateExtremePrice,
-              candleTime: candidateExtremeCandle!.openTime,
-              candleTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candleIndex: candidateExtremeIndex,
-              label: `LL${rangeSequenceIndex}`,
-              rangeId: newRangeId,
-            };
-
-            activeRange = createBearishRange(lhAnchor, llAnchor, newRangeId, rangeSequenceIndex);
-            ranges.push(activeRange);
-            currentState = StructureState.BEARISH;
-            currentPhase = 'RANGE_LOCKED';
-
-            // Decision Audit
-            audits.push({
-              eventId: confirmedLL.id,
-              regimeId: newRangeId,
-              cycleId: newRangeId,
-              sequenceId: confirmedLL.sequenceLabel ?? 'LL',
-              eventType: 'LL',
-              status: 'CONFIRMED',
-              trendStateBefore: StructureState.BEARISH,
-              trendStateAfter: StructureState.BEARISH,
-              candleIndex: candidateExtremeIndex,
-              timestamp: candidateExtremeCandle!.openTime,
-              timestampUnix: candidateExtremeCandle!.openTimeUnix,
-              price: candidateExtremePrice,
-              previousLockedAnchorType: StructurePointType.LH,
-              previousLockedAnchorPrice: fibAnchorPrice,
-              previousLockedAnchorTime: null,
-              previousStructuralExtremeType: StructurePointType.LL,
-              previousStructuralExtremePrice: activeRange.bottom.price,
-              previousStructuralExtremeTime: null,
-              breakRequired: true,
-              breakLevel: activeRange.bottom.price,
-              breakWasBodyClose: true,
-              breakWasWickOnly: false,
-              candidateExtremeType: StructurePointType.LL,
-              candidateExtremePrice,
-              candidateExtremeTime: candidateExtremeCandle!.openTime,
-              candidateExtremeTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candidateExtremeIndex,
-              retracementStartTime: candidateExtremeCandle!.openTime,
-              retracementExtremePrice,
-              retracementExtremeTime: retracementExtremeCandle?.openTime ?? null,
-              retracementExtremeTimeUnix: retracementExtremeCandle?.openTimeUnix ?? null,
-              retracementExtremeIndex,
-              retracementCandleCount: retracementCandles,
-              requiredRetracementCandles: minRetracementCandles,
-              candleCountQualified: true,
-              fibAnchorPrice,
-              fibExtremePrice: candidateExtremePrice,
-              fibRequiredRatio: minRetracementFib,
-              fibRequiredPrice,
-              actualRetracementRatio: actualFibDepth,
-              actualRetracementDepthPrice: retracementExtremePrice,
-              fibQualified: true,
-              decision: 'LL CONFIRMED',
-              decisionReason: confirmedLL.confirmationReason ?? '',
-              algorithmVersion: effectiveAlgorithmVersion,
-            });
-          }
-        }
-      } else if (candidateExtremeType === StructurePointType.HH) {
-        // Check opposing reversal break below fibAnchorPrice
-        if (candle.close < fibAnchorPrice) {
-          decisionTrace.push(
-            `OPPOSING REVERSAL: Close ${candle.close.toFixed(2)} < anchor ${fibAnchorPrice.toFixed(2)}. Aborting bullish leg.`
-          );
-          candidateExtremeType = StructurePointType.LL;
-          fibAnchorPrice = candidateExtremePrice;
-          candidateExtremePrice = candle.low;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-          retracementExtremePrice = -Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-        }
-        // Same-leg extension upward
-        else if (candle.high > candidateExtremePrice) {
-          candidateExtremePrice = candle.high;
-          candidateExtremeCandle = candle;
-          candidateExtremeIndex = i;
-          retracementExtremePrice = Infinity;
-          retracementExtremeCandle = null;
-          retracementExtremeIndex = -1;
-          decisionTrace.push(
-            `SAME-LEG EXTENSION: Candidate HH extended to ${candle.high.toFixed(2)}. Reset retracement tracking.`
-          );
-        }
-        // Retracement tracking
-        else {
-          if (candle.low < retracementExtremePrice) {
-            retracementExtremePrice = candle.low;
-            retracementExtremeCandle = candle;
-            retracementExtremeIndex = i;
-          }
-          const retracementCandles = i - candidateExtremeIndex;
-          const fibRange = Math.max(1e-6, candidateExtremePrice - fibAnchorPrice);
-          const fibRequiredPrice = candidateExtremePrice - minRetracementFib * fibRange;
-          const actualFibDepth = (candidateExtremePrice - retracementExtremePrice) / fibRange;
-          const isFibQualified = retracementExtremePrice <= fibRequiredPrice;
-          const isCandleCountQualified = retracementCandles >= minRetracementCandles;
-
-          decisionTrace.push(
-            `RETRACEMENT: Trough=${retracementExtremePrice.toFixed(2)}, Candles=${retracementCandles}/${minRetracementCandles}, Fib=${(actualFibDepth * 100).toFixed(1)}%/${(minRetracementFib * 100).toFixed(1)}%.`
-          );
-
-          if (isFibQualified && isCandleCountQualified) {
-            // CONFIRM BULLISH STRUCTURAL CYCLE
-            rangeSequenceIndex++;
-            const newRangeId = `BULLISH_RANGE_${rangeSequenceIndex}`;
-            decisionTrace.push(
-              `CONFIRMED BULLISH CYCLE: Both candle count (${retracementCandles}) and Fib (${(actualFibDepth * 100).toFixed(1)}%) qualified!`
-            );
-
-            // Invariant: Never allow HH -> HH without an HL.
-            // When a new HH confirms, set HL = LOWEST candle LOW between previous HH and new HH.
-            if (activeRange.direction === 'BULLISH') {
-              const prevHHIdx = activeRange.top.candleIndex ?? 0;
-              let lowestBetween = Infinity;
-              let lowestCandleBetween: NormalizedMarketCandle | null = null;
-              let lowestIdxBetween = -1;
-
-              for (let k = prevHHIdx; k <= candidateExtremeIndex; k++) {
-                const kc = evaluationCandles[k];
-                if (kc && kc.low < lowestBetween) {
-                  lowestBetween = kc.low;
-                  lowestCandleBetween = kc;
-                  lowestIdxBetween = k;
-                }
-              }
-
-              if (
-                lowestCandleBetween &&
-                lowestIdxBetween > prevHHIdx &&
-                lowestIdxBetween < candidateExtremeIndex
-              ) {
-                const interveningHL: StructurePoint = {
-                  id: `v6_HL_${rangeSequenceIndex}_${lowestCandleBetween.openTimeUnix}`,
-                  eventId: `v6_HL_${rangeSequenceIndex}_${lowestCandleBetween.openTimeUnix}`,
-                  symbol: candle.symbol,
-                  timeframe: candle.timeframe,
-                  candleOpenTime: lowestCandleBetween.openTime,
-                  candleOpenTimeUnix: lowestCandleBetween.openTimeUnix,
-                  candleIndex: lowestIdxBetween,
-                  type: StructurePointType.HL,
-                  price: lowestBetween,
-                  strength: StructureStrength.MAJOR,
-                  algorithmVersion: effectiveAlgorithmVersion,
-                  rangeId: newRangeId,
-                  sequenceLabel: `HL${rangeSequenceIndex}`,
-                  sequenceIndex: rangeSequenceIndex,
-                  isRangeBottom: true,
-                  isRangeTop: false,
-                  confirmed: true,
-                  structureScope: 'EXTERNAL',
-                  confirmationReason: `Lowest candle LOW (${lowestBetween.toFixed(2)}) between previous HH and new HH enforcing global swing alternation.`,
-                  detectedAt: new Date().toISOString(),
-                  createdAt: new Date().toISOString(),
-                };
-                points.push(interveningHL);
-                lastConfirmedHLPoint = interveningHL;
-              }
-            }
-
-            // Confirmed HH
-            const confirmedHH: StructurePoint = {
-              id: `v6_HH_${rangeSequenceIndex}_${candidateExtremeCandle!.openTimeUnix}`,
-              eventId: `v6_HH_${rangeSequenceIndex}_${candidateExtremeCandle!.openTimeUnix}`,
-              symbol: candle.symbol,
-              timeframe: candle.timeframe,
-              candleOpenTime: candidateExtremeCandle!.openTime,
-              candleOpenTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candleIndex: candidateExtremeIndex,
-              type: StructurePointType.HH,
-              price: candidateExtremePrice,
-              strength: StructureStrength.MAJOR,
-              algorithmVersion: effectiveAlgorithmVersion,
-              rangeId: newRangeId,
-              sequenceLabel: `HH${rangeSequenceIndex}`,
-              sequenceIndex: rangeSequenceIndex,
-              isRangeTop: true,
-              isRangeBottom: false,
-              confirmed: true,
-              structureScope: 'EXTERNAL',
-              confirmationReason: `Expansion high (${candidateExtremePrice.toFixed(2)}) qualified by subsequent retracement (${retracementCandles} candles, ${(actualFibDepth * 100).toFixed(1)}% Fib).`,
-              detectedAt: new Date().toISOString(),
-              createdAt: new Date().toISOString(),
-            };
-            points.push(confirmedHH);
-            lastConfirmedHHPoint = confirmedHH;
-            pointCreatedThisCandle = confirmedHH.id;
-
-            // Confirmed HL of the qualifying retracement
-            const confirmedHL: StructurePoint = {
-              id: `v6_HL_${rangeSequenceIndex}_${retracementExtremeCandle!.openTimeUnix}`,
-              eventId: `v6_HL_${rangeSequenceIndex}_${retracementExtremeCandle!.openTimeUnix}`,
-              symbol: candle.symbol,
-              timeframe: candle.timeframe,
-              candleOpenTime: retracementExtremeCandle!.openTime,
-              candleOpenTimeUnix: retracementExtremeCandle!.openTimeUnix,
-              candleIndex: retracementExtremeIndex,
-              type: StructurePointType.HL,
-              price: retracementExtremePrice,
-              strength: StructureStrength.MAJOR,
-              algorithmVersion: effectiveAlgorithmVersion,
-              rangeId: newRangeId,
-              sequenceLabel: `HL${rangeSequenceIndex}`,
-              sequenceIndex: rangeSequenceIndex,
-              isRangeBottom: true,
-              isRangeTop: false,
-              confirmed: true,
-              structureScope: 'EXTERNAL',
-              confirmationReason: `Qualifying retracement low (${retracementExtremePrice.toFixed(2)}) satisfying >= ${minRetracementCandles} candles and >= ${(minRetracementFib * 100).toFixed(1)}% Fib.`,
-              detectedAt: new Date().toISOString(),
-              createdAt: new Date().toISOString(),
-            };
-            points.push(confirmedHL);
-            lastConfirmedHLPoint = confirmedHL;
-
-            // Lock new Bullish Range
-            const hhAnchor: TypedStructuralAnchor<StructurePointType.HH> = {
-              type: StructurePointType.HH,
-              price: candidateExtremePrice,
-              candleTime: candidateExtremeCandle!.openTime,
-              candleTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candleIndex: candidateExtremeIndex,
-              label: `HH${rangeSequenceIndex}`,
-              rangeId: newRangeId,
-            };
-            const hlAnchor: TypedStructuralAnchor<StructurePointType.HL> = {
-              type: StructurePointType.HL,
-              price: retracementExtremePrice,
-              candleTime: retracementExtremeCandle!.openTime,
-              candleTimeUnix: retracementExtremeCandle!.openTimeUnix,
-              candleIndex: retracementExtremeIndex,
-              label: `HL${rangeSequenceIndex}`,
-              rangeId: newRangeId,
-            };
-
-            activeRange = createBullishRange(hhAnchor, hlAnchor, newRangeId, rangeSequenceIndex);
-            ranges.push(activeRange);
-            currentState = StructureState.BULLISH;
-            currentPhase = 'RANGE_LOCKED';
-
-            // Decision Audit
-            audits.push({
-              eventId: confirmedHH.id,
-              regimeId: newRangeId,
-              cycleId: newRangeId,
-              sequenceId: confirmedHH.sequenceLabel ?? 'HH',
-              eventType: 'HH',
-              status: 'CONFIRMED',
-              trendStateBefore: StructureState.BULLISH,
-              trendStateAfter: StructureState.BULLISH,
-              candleIndex: candidateExtremeIndex,
-              timestamp: candidateExtremeCandle!.openTime,
-              timestampUnix: candidateExtremeCandle!.openTimeUnix,
-              price: candidateExtremePrice,
-              previousLockedAnchorType: StructurePointType.HL,
-              previousLockedAnchorPrice: fibAnchorPrice,
-              previousLockedAnchorTime: null,
-              previousStructuralExtremeType: StructurePointType.HH,
-              previousStructuralExtremePrice: activeRange.top.price,
-              previousStructuralExtremeTime: null,
-              breakRequired: true,
-              breakLevel: activeRange.top.price,
-              breakWasBodyClose: true,
-              breakWasWickOnly: false,
-              candidateExtremeType: StructurePointType.HH,
-              candidateExtremePrice,
-              candidateExtremeTime: candidateExtremeCandle!.openTime,
-              candidateExtremeTimeUnix: candidateExtremeCandle!.openTimeUnix,
-              candidateExtremeIndex,
-              retracementStartTime: candidateExtremeCandle!.openTime,
-              retracementExtremePrice,
-              retracementExtremeTime: retracementExtremeCandle?.openTime ?? null,
-              retracementExtremeTimeUnix: retracementExtremeCandle?.openTimeUnix ?? null,
-              retracementExtremeIndex,
-              retracementCandleCount: retracementCandles,
-              requiredRetracementCandles: minRetracementCandles,
-              candleCountQualified: true,
-              fibAnchorPrice,
-              fibExtremePrice: candidateExtremePrice,
-              fibRequiredRatio: minRetracementFib,
-              fibRequiredPrice,
-              actualRetracementRatio: actualFibDepth,
-              actualRetracementDepthPrice: retracementExtremePrice,
-              fibQualified: true,
-              decision: 'HH CONFIRMED',
-              decisionReason: confirmedHH.confirmationReason ?? '',
-              algorithmVersion: effectiveAlgorithmVersion,
-            });
-          }
+          // Atomic commit: all derived values were validated before shared state changes.
+          const brokenPrevious: StructuralRange = {
+            ...proposed.previousRange,
+            status: proposed.breakEvent.breakType.includes('STRUCTURE_BROKEN') ? 'BROKEN_REVERSAL' : 'BROKEN_CONTINUATION',
+            endedAt: proposed.breakEvent.candleTime,
+            endedAtUnix: proposed.breakEvent.candleTimeUnix,
+            breakEventId: proposed.breakEvent.id,
+            breakCandleTime: proposed.breakEvent.candleTime,
+            breakCandleClose: proposed.breakEvent.price,
+          };
+          const previousIndex = ranges.findIndex((range) => range.rangeId === proposed.previousRange.rangeId);
+          if (previousIndex >= 0) ranges[previousIndex] = brokenPrevious;
+          points.push(...proposed.proposedPoints);
+          ranges.push(proposed.proposedRange);
+          activeRange = proposed.proposedRange;
+          engineState = proposed.nextState;
+          sequence++;
+          audits.push(...createAudits(proposed, algorithmVersion));
+          confirmedThisCandle = proposed.proposedPoints[0].id;
+          eventLogs.push(logItem(candle, 'STRUCTURE_CONFIRMED', `${candidate.direction} cycle confirmed`, trace[trace.length - 1]));
+          trace.push(`Committed ${proposed.proposedPoints.map((point) => point.type).join('+')} atomically.`);
+          candidate = null;
         }
       }
     }
 
-    recordStep(
-      candleReplaySteps,
-      i,
-      candle,
-      currentState,
-      currentPhase,
-      activeRange,
-      decisionTrace,
-      breakIdThisCandle,
-      pointCreatedThisCandle
-    );
+    recordReplay(candleReplaySteps, i, candle, engineState, activeRange, trace, breakThisCandle, confirmedThisCandle);
   }
 
-  // ==========================================
-  // POST-PROCESSING: Deduplication & Clean Invariant
-  // ==========================================
-  const cleanConfirmedPoints = deduplicatePoints(points);
-
-  // Build active retracement info for live cards
-  let activeRetracement: ActiveRetracementInfo | null = null;
-  if (currentPhase === 'EXPANSION_CANDIDATE' && candidateExtremeCandle) {
-    const isBearishLeg = candidateExtremeType === StructurePointType.LL;
-    const fibRange = Math.abs(fibAnchorPrice - candidateExtremePrice);
-    const fib382Price = isBearishLeg
-      ? candidateExtremePrice + minRetracementFib * fibRange
-      : candidateExtremePrice - minRetracementFib * fibRange;
-
-    const actualRetrace = retracementExtremePrice !== (isBearishLeg ? -Infinity : Infinity)
-      ? retracementExtremePrice
-      : candidateExtremePrice;
-    const retracementCandleCount = retracementExtremeIndex >= 0
-      ? evaluationCandles.length - 1 - candidateExtremeIndex
-      : 0;
-
-    const actualFibRatio = fibRange > 0
-      ? isBearishLeg
-        ? (actualRetrace - candidateExtremePrice) / fibRange
-        : (candidateExtremePrice - actualRetrace) / fibRange
-      : 0;
-
-    const isFibQualified = isBearishLeg
-      ? actualRetrace >= fib382Price
-      : actualRetrace <= fib382Price;
-    const isCandleCountQualified = retracementCandleCount >= minRetracementCandles;
-
-    activeRetracement = {
-      state: currentState,
-      candidateType: candidateExtremeType,
-      candidatePrice: candidateExtremePrice,
-      candidateTime: candidateExtremeCandle.openTime,
-      candidateTimeUnix: candidateExtremeCandle.openTimeUnix,
-      candidateCandleIndex: candidateExtremeIndex,
-      referencePrice: fibAnchorPrice,
-      referenceTime: (fibAnchorCandle as any)?.openTime ?? (fibAnchorCandle as any)?.candleTime ?? '',
-      fibLevelPrice: fib382Price,
-      fibRatio: minRetracementFib,
-      currentRetracementCandles: retracementCandleCount,
-      requiredRetracementCandles: minRetracementCandles,
-      currentRetracementPrice: actualRetrace,
-      currentFibDepth: Math.max(0, actualFibRatio),
-      currentRetracementExtremePrice: actualRetrace,
-      currentRetracementExtremeTime: retracementExtremeCandle?.openTime ?? null,
-      currentRetracementExtremeIndex: retracementExtremeIndex,
-      isCandleCountQualified,
-      isFibDepthQualified: isFibQualified,
-      isFullyQualified: isCandleCountQualified && isFibQualified,
-      retracementQualified: isCandleCountQualified && isFibQualified,
-      requiredCandles: minRetracementCandles,
-      requiredFib: minRetracementFib,
-    };
-  }
-
-  // Aggregate stats
-  const hhPoints = cleanConfirmedPoints.filter((p) => p.type === StructurePointType.HH);
-  const hlPoints = cleanConfirmedPoints.filter((p) => p.type === StructurePointType.HL);
-  const llPoints = cleanConfirmedPoints.filter((p) => p.type === StructurePointType.LL);
-  const lhPoints = cleanConfirmedPoints.filter((p) => p.type === StructurePointType.LH);
+  validateFinalState(points, ranges, activeRange, engineState);
+  const activeRetracement = candidate
+    ? buildActiveRetracement(candidate, activeRange, minimumRetracementCandles, minimumRetracementFib)
+    : null;
+  const byType = (type: StructurePointType) => points.filter((point) => point.type === type);
+  const hh = byType(StructurePointType.HH);
+  const hl = byType(StructurePointType.HL);
+  const lh = byType(StructurePointType.LH);
+  const ll = byType(StructurePointType.LL);
 
   return {
-    symbol: evaluationCandles[0]?.symbol ?? 'BTC_USDT',
-    timeframe: evaluationCandles[0]?.timeframe ?? '5M',
-    algorithmVersion: effectiveAlgorithmVersion,
-    parameters: {
-      analysisCandles,
-      initializationSearchCandles: warmUpCandles,
-      breakConfirmation: 'CLOSE',
-      minimumRetracementCandles: minRetracementCandles,
-      minimumRetracementFib: minRetracementFib,
-      lookbackCandles: lookback,
-      fibTouchMode: 'WICK',
-      algorithmVersion: effectiveAlgorithmVersion,
-    },
-    structureState: currentState,
-    stateLabel: currentState,
-    totalCandlesAvailable: totalAvailable,
-    closedCandlesEvaluated: evaluationCandles.length,
-    unclosedCandleExcluded: false,
-    workingWindowStart: evaluationCandles[0]?.openTime ?? null,
-    workingWindowEnd: evaluationCandles[evaluationCandles.length - 1]?.openTime ?? null,
-    hhCount: hhPoints.length,
-    hlCount: hlPoints.length,
-    llCount: llPoints.length,
-    lhCount: lhPoints.length,
+    symbol,
+    timeframe,
+    algorithmVersion,
+    parameters,
+    structureState: activeRange?.direction === 'BULLISH' ? StructureState.BULLISH : activeRange ? StructureState.BEARISH : StructureState.UNDEFINED,
+    stateLabel: engineState,
+    totalCandlesAvailable,
+    closedCandlesEvaluated: candles.length,
+    unclosedCandleExcluded,
+    workingWindowStart: candles[0]?.openTime ?? null,
+    workingWindowEnd: candles[candles.length - 1]?.openTime ?? null,
+    hhCount: hh.length,
+    hlCount: hl.length,
+    lhCount: lh.length,
+    llCount: ll.length,
     provisionalCount: 0,
-    totalPointsCount: cleanConfirmedPoints.length,
-    lastHH: hhPoints[hhPoints.length - 1] ?? null,
-    lastHL: hlPoints[hlPoints.length - 1] ?? null,
-    lastLL: llPoints[llPoints.length - 1] ?? null,
-    lastLH: lhPoints[lhPoints.length - 1] ?? null,
+    totalPointsCount: points.length,
+    lastHH: hh.at(-1) ?? null,
+    lastHL: hl.at(-1) ?? null,
+    lastLH: lh.at(-1) ?? null,
+    lastLL: ll.at(-1) ?? null,
+    lastConfirmedHH: hh.at(-1) ?? null,
+    lastConfirmedHL: hl.at(-1) ?? null,
+    lastConfirmedLH: lh.at(-1) ?? null,
+    lastConfirmedLL: ll.at(-1) ?? null,
     activeProvisionalPoint: null,
     activeRetracement,
-    points: cleanConfirmedPoints,
+    points,
     ranges,
     activeRange,
     internalStructureIgnored: true,
@@ -1206,169 +336,483 @@ export function detectStructureV6FibQualifiedRange(
     audits,
     rejectedEvents,
     candleReplaySteps,
-    executionTimeMs: Date.now() - startTime,
+    engineState: candleReplaySteps.at(-1)?.engineState,
+    executionTimeMs: Date.now() - started,
     detectedAt: new Date().toISOString(),
-    initialization: initResult,
+    initialization,
   };
 }
 
-function discoverInitialExternalRange(
-  candles: NormalizedMarketCandle[]
-): InitialRangeDiscovery | null {
-  if (candles.length < 5) return null;
+function findNearestQualifiedWarmUpCycle(
+  candles: NormalizedMarketCandle[],
+  minimumCandles: number,
+  minimumFib: number
+): InitializationCandidate | null {
+  const completed: InitializationCandidate[] = [];
+  for (let breakIndex = 1; breakIndex < candles.length; breakIndex++) {
+    const prior = candles.slice(0, breakIndex);
+    const priorHigh = Math.max(...prior.map((c) => c.high));
+    const priorLow = Math.min(...prior.map((c) => c.low));
+    const direction: Direction | null = candles[breakIndex].close > priorHigh
+      ? 'BULLISH'
+      : candles[breakIndex].close < priorLow
+        ? 'BEARISH'
+        : null;
+    if (!direction) continue;
 
-  let highestHigh = -Infinity;
-  let highestCandle = candles[0];
-  let highestIndex = 0;
-
-  let lowestLow = Infinity;
-  let lowestCandle = candles[0];
-  let lowestIndex = 0;
-
-  for (let i = 0; i < candles.length; i++) {
-    const c = candles[i];
-    if (c.high > highestHigh) {
-      highestHigh = c.high;
-      highestCandle = c;
-      highestIndex = i;
-    }
-    if (c.low < lowestLow) {
-      lowestLow = c.low;
-      lowestCandle = c;
-      lowestIndex = i;
+    const anchorPrice = direction === 'BULLISH' ? priorLow : priorHigh;
+    let extreme: Extreme = { price: direction === 'BULLISH' ? candles[breakIndex].high : candles[breakIndex].low, candle: candles[breakIndex], index: breakIndex };
+    let retracement: Extreme | null = null;
+    for (let i = breakIndex + 1; i < candles.length; i++) {
+      const candle = candles[i];
+      const isExtension = direction === 'BULLISH' ? candle.high > extreme.price : candle.low < extreme.price;
+      if (isExtension) {
+        extreme = { price: direction === 'BULLISH' ? candle.high : candle.low, candle, index: i };
+        retracement = null;
+        continue;
+      }
+      if (!retracement || (direction === 'BULLISH' ? candle.low < retracement.price : candle.high > retracement.price)) {
+        retracement = { price: direction === 'BULLISH' ? candle.low : candle.high, candle, index: i };
+      }
+      const count = i - extreme.index;
+      const range = Math.abs(extreme.price - anchorPrice);
+      const depth = range > 0
+        ? direction === 'BULLISH'
+          ? (extreme.price - retracement.price) / range
+          : (retracement.price - extreme.price) / range
+        : 0;
+      if (count >= minimumCandles && depth >= minimumFib) {
+        completed.push({ direction, extreme, retracement, anchorPrice, confirmationIndex: i, retracementCandles: count, fibDepth: depth });
+        break;
+      }
     }
   }
+  return completed.sort((a, b) => b.confirmationIndex - a.confirmationIndex)[0] ?? null;
+}
 
-  if (highestHigh <= lowestLow) return null;
-
-  if (highestIndex < lowestIndex) {
-    return {
-      direction: 'BEARISH',
-      topPrice: highestHigh,
-      topCandle: highestCandle,
-      topIndex: highestIndex,
-      bottomPrice: lowestLow,
-      bottomCandle: lowestCandle,
-      bottomIndex: lowestIndex,
-    };
+function detectBreak(
+  range: StructuralRange,
+  candle: NormalizedMarketCandle,
+  index: number,
+  rejected: RejectedStructureEvent[]
+): { event: StructureBreakEvent; candidate: CandidateLeg } | null {
+  let direction: Direction | null = null;
+  let brokenLevel = 0;
+  let breakType = '';
+  let anchor: TypedStructuralAnchor<StructurePointType>;
+  if (range.direction === 'BULLISH') {
+    if (candle.close > range.top.price) {
+      direction = 'BULLISH'; brokenLevel = range.top.price; breakType = 'BULLISH_CONTINUATION'; anchor = range.bottom;
+    } else if (candle.close < range.bottom.price) {
+      direction = 'BEARISH'; brokenLevel = range.bottom.price; breakType = 'BULLISH_STRUCTURE_BROKEN'; anchor = range.top;
+    } else {
+      rejectWicks(range, candle, index, rejected);
+      return null;
+    }
+  } else {
+    if (candle.close < range.bottom.price) {
+      direction = 'BEARISH'; brokenLevel = range.bottom.price; breakType = 'BEARISH_CONTINUATION'; anchor = range.top;
+    } else if (candle.close > range.top.price) {
+      direction = 'BULLISH'; brokenLevel = range.top.price; breakType = 'BEARISH_STRUCTURE_BROKEN'; anchor = range.bottom;
+    } else {
+      rejectWicks(range, candle, index, rejected);
+      return null;
+    }
   }
-
+  const event: StructureBreakEvent = {
+    id: `v6r3_break_${range.rangeId}_${candle.openTimeUnix}`,
+    candleTime: candle.openTime,
+    candleTimeUnix: candle.openTimeUnix,
+    candleIndex: index,
+    price: candle.close,
+    brokenLevel,
+    breakType,
+    label: breakType,
+    regimeId: range.rangeId,
+  };
   return {
-    direction: 'BULLISH',
-    topPrice: highestHigh,
-    topCandle: highestCandle,
-    topIndex: highestIndex,
-    bottomPrice: lowestLow,
-    bottomCandle: lowestCandle,
-    bottomIndex: lowestIndex,
+    event,
+    candidate: {
+      direction,
+      anchor,
+      breakEvent: event,
+      breakCandle: candle,
+      extreme: { price: direction === 'BULLISH' ? candle.high : candle.low, candle, index },
+      retracement: null,
+      retracementCandles: 0,
+    },
   };
 }
 
-function createPointFromBoundary(
-  b: StructuralRangeBoundary | TypedStructuralAnchor<any>,
+function extendCandidate(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number): boolean {
+  const extended = candidate.direction === 'BULLISH'
+    ? candle.high > candidate.extreme.price
+    : candle.low < candidate.extreme.price;
+  if (!extended) return false;
+  candidate.extreme = { price: candidate.direction === 'BULLISH' ? candle.high : candle.low, candle, index };
+  candidate.retracement = null;
+  candidate.retracementCandles = 0;
+  return true;
+}
+
+function updateRetracement(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number): void {
+  const price = candidate.direction === 'BULLISH' ? candle.low : candle.high;
+  if (!candidate.retracement || (candidate.direction === 'BULLISH' ? price < candidate.retracement.price : price > candidate.retracement.price)) {
+    candidate.retracement = { price, candle, index };
+  }
+  candidate.retracementCandles = index - candidate.extreme.index;
+}
+
+function qualify(candidate: CandidateLeg, requiredCandles: number, requiredFib: number) {
+  const range = Math.abs(candidate.extreme.price - candidate.anchor.price);
+  const retracementPrice = candidate.retracement?.price ?? candidate.extreme.price;
+  const fibDepth = range > 0
+    ? candidate.direction === 'BULLISH'
+      ? (candidate.extreme.price - retracementPrice) / range
+      : (retracementPrice - candidate.extreme.price) / range
+    : 0;
+  const fibRequiredPrice = candidate.direction === 'BULLISH'
+    ? candidate.extreme.price - requiredFib * range
+    : candidate.extreme.price + requiredFib * range;
+  return {
+    candleCount: candidate.retracementCandles,
+    fibDepth,
+    fibRequiredPrice,
+    candleQualified: candidate.retracementCandles >= requiredCandles,
+    fibQualified: candidate.direction === 'BULLISH' ? retracementPrice <= fibRequiredPrice : retracementPrice >= fibRequiredPrice,
+    requiredCandles,
+    requiredFib,
+  };
+}
+
+function proposeTransition(
+  previousRange: StructuralRange,
+  candidate: CandidateLeg,
+  retracement: Extreme,
+  symbol: string,
+  timeframe: string,
+  algorithmVersion: string,
+  sequence: number,
+  qualification: ReturnType<typeof qualify>
+): ProposedTransition {
+  const created = createQualifiedPair(
+    candidate.direction,
+    candidate.extreme,
+    retracement,
+    symbol,
+    timeframe,
+    algorithmVersion,
+    sequence,
+    qualification.candleCount,
+    qualification.fibDepth,
+    false
+  );
+  return {
+    previousRange,
+    breakEvent: candidate.breakEvent,
+    candidateExtreme: candidate.extreme,
+    retracementExtreme: retracement,
+    proposedPoints: created.points,
+    proposedRange: created.range,
+    nextState: candidate.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH',
+    retracementCandles: qualification.candleCount,
+    fibDepth: qualification.fibDepth,
+    fibRequiredPrice: qualification.fibRequiredPrice,
+    requiredRetracementCandles: qualification.requiredCandles,
+    requiredRetracementFib: qualification.requiredFib,
+  };
+}
+
+function createQualifiedPair(
+  direction: Direction,
+  extreme: Extreme,
+  retracement: Extreme,
+  symbol: string,
+  timeframe: string,
+  algorithmVersion: string,
+  sequence: number,
+  retracementCandles: number,
+  fibDepth: number,
+  warmUp: boolean
+): { points: [StructurePoint, StructurePoint]; range: BullishRange | BearishRange } {
+  const rangeId = `V6R3_${direction}_RANGE_${sequence}`;
+  const extremeType = direction === 'BULLISH' ? StructurePointType.HH : StructurePointType.LL;
+  const retracementType = direction === 'BULLISH' ? StructurePointType.HL : StructurePointType.LH;
+  const extremePoint = makePoint(extremeType, extreme, symbol, timeframe, algorithmVersion, rangeId, sequence, retracementCandles, fibDepth, warmUp);
+  const retracementPoint = makePoint(retracementType, retracement, symbol, timeframe, algorithmVersion, rangeId, sequence, retracementCandles, fibDepth, warmUp);
+  const extremeAnchor = pointToAnchor(extremePoint);
+  const retracementAnchor = pointToAnchor(retracementPoint);
+  const range = direction === 'BULLISH'
+    ? createBullishRange(
+        extremeAnchor as TypedStructuralAnchor<StructurePointType.HH>,
+        retracementAnchor as TypedStructuralAnchor<StructurePointType.HL>,
+        rangeId,
+        sequence
+      )
+    : createBearishRange(
+        retracementAnchor as TypedStructuralAnchor<StructurePointType.LH>,
+        extremeAnchor as TypedStructuralAnchor<StructurePointType.LL>,
+        rangeId,
+        sequence
+      );
+  return { points: [extremePoint, retracementPoint], range };
+}
+
+function makePoint(
+  type: StructurePointType.HH | StructurePointType.HL | StructurePointType.LH | StructurePointType.LL,
+  source: Extreme,
+  symbol: string,
+  timeframe: string,
+  algorithmVersion: string,
   rangeId: string,
-  direction: 'BULLISH' | 'BEARISH',
-  isTop: boolean,
-  isBottom: boolean,
-  algorithmVersion: string
+  sequence: number,
+  retracementCandles: number,
+  fibDepth: number,
+  warmUp: boolean
 ): StructurePoint {
-  const id = `v6_${b.type}_${b.candleTimeUnix}`;
+  const id = `v6r3_${rangeId}_${type}_${source.candle.openTimeUnix}`;
   return {
     id,
     eventId: id,
-    symbol: 'BTC_USDT',
-    timeframe: '5M',
-    candleOpenTime: b.candleTime,
-    candleOpenTimeUnix: b.candleTimeUnix,
-    candleIndex: b.candleIndex,
-    type: b.type,
-    price: b.price,
+    auditId: `${id}_audit`,
+    symbol,
+    timeframe,
+    candleOpenTime: source.candle.openTime,
+    candleOpenTimeUnix: source.candle.openTimeUnix,
+    candleIndex: source.index,
+    type,
+    price: source.price,
     strength: StructureStrength.MAJOR,
     algorithmVersion,
     rangeId,
-    sequenceLabel: b.label,
-    sequenceIndex: parseInt(b.label.replace(/\D/g, '') || '1', 10),
-    isRangeTop: isTop,
-    isRangeBottom: isBottom,
+    sequenceIndex: sequence,
+    sequenceLabel: `${type}${sequence}`,
+    isRangeTop: type === StructurePointType.HH || type === StructurePointType.LH,
+    isRangeBottom: type === StructurePointType.HL || type === StructurePointType.LL,
     confirmed: true,
     structureScope: 'EXTERNAL',
-    confirmationReason: `Structural range ${isTop ? 'TOP' : 'BOTTOM'} locked for ${rangeId}.`,
-    detectedAt: new Date().toISOString(),
-    createdAt: new Date().toISOString(),
+    retracementCandles,
+    retracementFibDepth: fibDepth,
+    isWarmUpAnchor: warmUp,
+    confirmationReason: warmUp ? 'Nearest qualified prior warm-up cycle.' : 'Body-close break followed by candle-count and wick-Fibonacci qualified retracement.',
+    detectedAt: new Date(0).toISOString(),
+    createdAt: new Date(0).toISOString(),
   };
 }
 
-function recordWickRejection(
-  rejectedList: RejectedStructureEvent[],
-  candle: NormalizedMarketCandle,
-  index: number,
-  attemptedLevel: number,
-  actualValue: number,
-  rangeId: string,
-  rejectionType: 'REJECTED_LOW' | 'REJECTED_HIGH' | 'REJECTED_INVALIDATION' | 'REJECTED_RETRACEMENT',
-  reason: string
-) {
-  rejectedList.push({
-    id: `rej_${rangeId}_${candle.openTimeUnix}`,
-    rangeId,
-    cycleId: rangeId,
-    candleIndex: index,
-    candleTime: candle.openTime,
-    candleTimeUnix: candle.openTimeUnix,
-    timestamp: candle.openTime,
-    timestampUnix: candle.openTimeUnix,
-    price: actualValue,
-    attemptedLevel,
-    actualValue,
-    requiredValue: attemptedLevel,
-    rejectionType,
-    label: 'WICK BREACH (NO BODY CLOSE)',
-    reason,
-  });
+function pointToAnchor(point: StructurePoint): TypedStructuralAnchor<StructurePointType> {
+  return {
+    type: point.type,
+    price: point.price,
+    candleTime: point.candleOpenTime,
+    candleTimeUnix: point.candleOpenTimeUnix,
+    candleIndex: point.candleIndex,
+    label: point.sequenceLabel ?? point.type,
+    eventId: point.eventId,
+    rangeId: point.rangeId,
+  };
 }
 
-function recordStep(
+function seedManualRange(
+  manual: NonNullable<StructureParameters['manualStart']>,
+  candles: NormalizedMarketCandle[],
+  symbol: string,
+  timeframe: string,
+  algorithmVersion: string,
+  sequence: number
+): { points: [StructurePoint, StructurePoint]; range: BullishRange | BearishRange } {
+  const locate = (value: typeof manual.top, fallback: number): Extreme => {
+    const unix = value.candleTimeUnix ?? new Date(value.candleTime).getTime();
+    const index = value.candleIndex ?? candles.findIndex((c) => c.openTimeUnix === unix);
+    const candle = candles[index >= 0 ? index : fallback] ?? candles[0];
+    return { price: value.price, candle: { ...candle, openTime: value.candleTime, openTimeUnix: unix }, index: index >= 0 ? index : fallback };
+  };
+  const top = locate(manual.top, 0);
+  const bottom = locate(manual.bottom, 1);
+  return manual.direction === 'BULLISH'
+    ? createQualifiedPair('BULLISH', top, bottom, symbol, timeframe, algorithmVersion, sequence, 0, 0, true)
+    : createQualifiedPair('BEARISH', bottom, top, symbol, timeframe, algorithmVersion, sequence, 0, 0, true);
+}
+
+function validateTransition(
+  proposed: ProposedTransition,
+  confirmingCandle: NormalizedMarketCandle,
+  symbol: string,
+  timeframe: string,
+  ranges: StructuralRange[]
+): void {
+  const [extreme, retracement] = proposed.proposedPoints;
+  if (proposed.proposedPoints.length !== 2) throw new Error('V6 invariant failure: a cycle must contain exactly two points.');
+  if (!assertSingleStructureType(extreme) || !assertSingleStructureType(retracement)) throw new Error('V6 invariant failure: invalid point type.');
+  const bullish = proposed.nextState === 'RANGE_LOCKED_BULLISH';
+  const expected = bullish ? [StructurePointType.HH, StructurePointType.HL] : [StructurePointType.LL, StructurePointType.LH];
+  if (extreme.type !== expected[0] || retracement.type !== expected[1]) throw new Error('V6 invariant failure: invalid directional point pair.');
+  if (proposed.proposedRange.direction !== (bullish ? 'BULLISH' : 'BEARISH')) throw new Error('V6 invariant failure: range/state disagreement.');
+  const topPoint = bullish ? extreme : retracement;
+  const bottomPoint = bullish ? retracement : extreme;
+  if (proposed.proposedRange.top.eventId !== topPoint.eventId || proposed.proposedRange.bottom.eventId !== bottomPoint.eventId) throw new Error('V6 invariant failure: emitted points differ from range boundaries.');
+  if (ranges.filter((range) => range.status === 'ACTIVE').length !== 1) throw new Error('V6 invariant failure: expected one active prior range.');
+  const breakCloseQualified = proposed.breakEvent.breakType === 'BULLISH_CONTINUATION'
+    ? proposed.breakEvent.price > proposed.previousRange.top.price
+    : proposed.breakEvent.breakType === 'BEARISH_CONTINUATION'
+      ? proposed.breakEvent.price < proposed.previousRange.bottom.price
+      : proposed.breakEvent.breakType === 'BEARISH_STRUCTURE_BROKEN'
+        ? proposed.breakEvent.price > proposed.previousRange.top.price
+        : proposed.breakEvent.price < proposed.previousRange.bottom.price;
+  if (!proposed.breakEvent.id || !breakCloseQualified || confirmingCandle.isClosed !== true) throw new Error('V6 invariant failure: transition requires a closed-candle body break.');
+  if (proposed.retracementCandles < proposed.requiredRetracementCandles || proposed.fibDepth < proposed.requiredRetracementFib) throw new Error('V6 invariant failure: retracement was not qualified.');
+  if (extreme.symbol !== symbol || retracement.symbol !== symbol || extreme.timeframe !== timeframe || retracement.timeframe !== timeframe) throw new Error('V6 invariant failure: symbol/timeframe mismatch.');
+  if (extreme.eventId === retracement.eventId || extreme.candleOpenTimeUnix === retracement.candleOpenTimeUnix) throw new Error('V6 invariant failure: opposing types share one event.');
+}
+
+function validateFinalState(points: StructurePoint[], ranges: StructuralRange[], activeRange: StructuralRange | null, state: V6EngineState): void {
+  const active = ranges.filter((range) => range.status === 'ACTIVE');
+  if (activeRange) {
+    if (active.length !== 1 || active[0].rangeId !== activeRange.rangeId) throw new Error('V6 invariant failure: exactly one range must be active.');
+    const direction = state.includes('BULLISH') ? 'BULLISH' : state.includes('BEARISH') ? 'BEARISH' : null;
+    if (state.startsWith('RANGE_LOCKED') && direction !== activeRange.direction) throw new Error('V6 invariant failure: state and active range direction disagree.');
+  } else if (active.length !== 0 || state !== 'UNINITIALIZED') {
+    throw new Error('V6 invariant failure: undefined state cannot own an active range.');
+  }
+  const events = new Set<string>();
+  for (const point of points) {
+    const key = point.eventId ?? point.id;
+    if (events.has(key)) throw new Error(`V6 invariant failure: duplicate event ${key}.`);
+    events.add(key);
+  }
+}
+
+function createAudits(proposed: ProposedTransition, algorithmVersion: string): StructureDecisionAudit[] {
+  return proposed.proposedPoints.map((point) => ({
+    eventId: point.auditId!,
+    regimeId: proposed.proposedRange.rangeId,
+    cycleId: proposed.proposedRange.rangeId,
+    sequenceId: point.sequenceLabel ?? point.type,
+    eventType: point.type as 'HH' | 'HL' | 'LH' | 'LL',
+    status: 'CONFIRMED',
+    trendStateBefore: proposed.previousRange.direction === 'BULLISH' ? StructureState.BULLISH : StructureState.BEARISH,
+    trendStateAfter: proposed.proposedRange.direction === 'BULLISH' ? StructureState.BULLISH : StructureState.BEARISH,
+    candleIndex: point.candleIndex ?? 0,
+    timestamp: point.candleOpenTime,
+    timestampUnix: point.candleOpenTimeUnix,
+    price: point.price,
+    previousLockedAnchorType: proposed.previousRange.direction === 'BULLISH' ? StructurePointType.HL : StructurePointType.LH,
+    previousLockedAnchorPrice: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.bottom.price : proposed.previousRange.top.price,
+    previousLockedAnchorTime: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.bottom.candleTime : proposed.previousRange.top.candleTime,
+    previousStructuralExtremeType: proposed.previousRange.direction === 'BULLISH' ? StructurePointType.HH : StructurePointType.LL,
+    previousStructuralExtremePrice: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.top.price : proposed.previousRange.bottom.price,
+    previousStructuralExtremeTime: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.top.candleTime : proposed.previousRange.bottom.candleTime,
+    breakRequired: true,
+    breakLevel: proposed.breakEvent.brokenLevel,
+    breakCandleOpen: null,
+    breakCandleHigh: null,
+    breakCandleLow: null,
+    breakCandleClose: proposed.breakEvent.price,
+    breakWasBodyClose: true,
+    breakWasWickOnly: false,
+    candidateExtremeType: proposed.candidateExtreme === proposed.retracementExtreme ? null : proposed.proposedPoints[0].type,
+    candidateExtremePrice: proposed.candidateExtreme.price,
+    candidateExtremeTime: proposed.candidateExtreme.candle.openTime,
+    candidateExtremeTimeUnix: proposed.candidateExtreme.candle.openTimeUnix,
+    candidateExtremeIndex: proposed.candidateExtreme.index,
+    retracementStartTime: proposed.candidateExtreme.candle.openTime,
+    retracementExtremePrice: proposed.retracementExtreme.price,
+    retracementExtremeTime: proposed.retracementExtreme.candle.openTime,
+    retracementExtremeTimeUnix: proposed.retracementExtreme.candle.openTimeUnix,
+    retracementExtremeIndex: proposed.retracementExtreme.index,
+    retracementCandleCount: proposed.retracementCandles,
+    requiredRetracementCandles: proposed.requiredRetracementCandles,
+    candleCountQualified: true,
+    fibAnchorPrice: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.bottom.price : proposed.previousRange.top.price,
+    fibExtremePrice: proposed.candidateExtreme.price,
+    fibRequiredRatio: proposed.requiredRetracementFib,
+    fibRequiredPrice: proposed.fibRequiredPrice,
+    actualRetracementRatio: proposed.fibDepth,
+    actualRetracementDepthPrice: proposed.retracementExtreme.price,
+    fibQualified: true,
+    decision: `${point.type} CONFIRMED`,
+    decisionReason: point.confirmationReason ?? '',
+    algorithmVersion,
+  }));
+}
+
+function rejectWicks(range: StructuralRange, candle: NormalizedMarketCandle, index: number, rejected: RejectedStructureEvent[]): void {
+  const attempts: Array<{ breached: boolean; level: number; value: number; kind: 'REJECTED_HIGH' | 'REJECTED_LOW' }> = [
+    { breached: candle.high > range.top.price, level: range.top.price, value: candle.high, kind: 'REJECTED_HIGH' },
+    { breached: candle.low < range.bottom.price, level: range.bottom.price, value: candle.low, kind: 'REJECTED_LOW' },
+  ];
+  for (const attempt of attempts) {
+    if (!attempt.breached) continue;
+    rejected.push({
+      id: `v6r3_rejected_${range.rangeId}_${attempt.kind}_${candle.openTimeUnix}`,
+      rangeId: range.rangeId,
+      cycleId: range.rangeId,
+      candleIndex: index,
+      candleTime: candle.openTime,
+      candleTimeUnix: candle.openTimeUnix,
+      timestamp: candle.openTime,
+      timestampUnix: candle.openTimeUnix,
+      price: attempt.value,
+      attemptedLevel: attempt.level,
+      actualValue: attempt.value,
+      requiredValue: attempt.level,
+      rejectionType: attempt.kind,
+      label: 'WICK BREACH (NO BODY CLOSE)',
+      reason: `Wick crossed ${attempt.level}, but close ${candle.close} did not.`,
+    });
+  }
+}
+
+function buildActiveRetracement(candidate: CandidateLeg, range: StructuralRange | null, requiredCandles: number, requiredFib: number): ActiveRetracementInfo {
+  const qualification = qualify(candidate, requiredCandles, requiredFib);
+  return {
+    state: range?.direction === 'BULLISH' ? StructureState.BULLISH : range ? StructureState.BEARISH : StructureState.UNDEFINED,
+    candidateType: candidate.direction === 'BULLISH' ? StructurePointType.PROVISIONAL_HH : StructurePointType.PROVISIONAL_LL,
+    candidatePrice: candidate.extreme.price,
+    candidateTime: candidate.extreme.candle.openTime,
+    candidateTimeUnix: candidate.extreme.candle.openTimeUnix,
+    candidateCandleIndex: candidate.extreme.index,
+    referencePrice: candidate.anchor.price,
+    referenceTime: candidate.anchor.candleTime,
+    fibLevelPrice: qualification.fibRequiredPrice,
+    fibRatio: requiredFib,
+    currentRetracementCandles: qualification.candleCount,
+    requiredRetracementCandles: requiredCandles,
+    currentRetracementPrice: candidate.retracement?.price ?? candidate.extreme.price,
+    currentFibDepth: Math.max(0, qualification.fibDepth),
+    currentRetracementExtremePrice: candidate.retracement?.price ?? null,
+    currentRetracementExtremeTime: candidate.retracement?.candle.openTime ?? null,
+    currentRetracementExtremeIndex: candidate.retracement?.index ?? null,
+    isCandleCountQualified: qualification.candleQualified,
+    isFibDepthQualified: qualification.fibQualified,
+    isFullyQualified: qualification.candleQualified && qualification.fibQualified,
+    retracementQualified: qualification.candleQualified && qualification.fibQualified,
+    requiredCandles,
+    requiredFib,
+  };
+}
+
+function recordReplay(
   steps: CandleReplayStep[],
   index: number,
   candle: NormalizedMarketCandle,
-  state: StructureState,
-  phase: string,
-  activeRange: StructuralRange | null,
+  state: V6EngineState,
+  range: StructuralRange | null,
   decisionTrace: string[],
   breakId: string | null,
-  pointCreated: string | null
-) {
-  const engineState: EngineStateSnapshot = {
-    state,
-    phase: phase as any,
-    activeTopAnchor:
-      activeRange && activeRange.status === 'ACTIVE'
-        ? {
-            type: activeRange.top.type,
-            price: activeRange.top.price,
-            label: activeRange.top.label,
-            eventId: activeRange.top.eventId,
-            candleTime: activeRange.top.candleTime,
-            candleIndex: activeRange.top.candleIndex,
-          }
-        : null,
-    activeBottomAnchor:
-      activeRange && activeRange.status === 'ACTIVE'
-        ? {
-            type: activeRange.bottom.type,
-            price: activeRange.bottom.price,
-            label: activeRange.bottom.label,
-            eventId: activeRange.bottom.eventId,
-            candleTime: activeRange.bottom.candleTime,
-            candleIndex: activeRange.bottom.candleIndex,
-          }
-        : null,
+  pointId: string | null
+): void {
+  const publicState = range?.direction === 'BULLISH' ? StructureState.BULLISH : range ? StructureState.BEARISH : StructureState.UNDEFINED;
+  const snapshot: EngineStateSnapshot = {
+    state: publicState,
+    phase: state as any,
+    activeTopAnchor: range ? { type: range.top.type, price: range.top.price, label: range.top.label, eventId: range.top.eventId, candleTime: range.top.candleTime, candleIndex: range.top.candleIndex } : null,
+    activeBottomAnchor: range ? { type: range.bottom.type, price: range.bottom.price, label: range.bottom.label, eventId: range.bottom.eventId, candleTime: range.bottom.candleTime, candleIndex: range.bottom.candleIndex } : null,
     lastBreakEvent: breakId,
     candleIndex: index,
-    rangeId: activeRange?.rangeId,
-    direction: activeRange?.direction,
+    rangeId: range?.rangeId,
+    direction: range?.direction,
   };
-
   steps.push({
     candleIndex: index,
     time: candle.openTime,
@@ -1379,130 +823,50 @@ function recordStep(
     high: candle.high,
     low: candle.low,
     close: candle.close,
-    state,
-    trendState: state,
-    rangeId: activeRange?.rangeId,
-    activeRange: activeRange
-      ? {
-          rangeId: activeRange.rangeId,
-          direction: activeRange.direction,
-          topPrice: activeRange.top.price,
-          bottomPrice: activeRange.bottom.price,
-          topLabel: activeRange.top.label,
-          bottomLabel: activeRange.bottom.label,
-        }
-      : null,
-    lockedAnchor: activeRange
-      ? {
-          type:
-            activeRange.direction === 'BEARISH'
-              ? activeRange.top.type
-              : activeRange.bottom.type,
-          price:
-            activeRange.direction === 'BEARISH'
-              ? activeRange.top.price
-              : activeRange.bottom.price,
-          time:
-            activeRange.direction === 'BEARISH'
-              ? activeRange.top.candleTime
-              : activeRange.bottom.candleTime,
-          label:
-            activeRange.direction === 'BEARISH'
-              ? activeRange.top.label
-              : activeRange.bottom.label,
-        }
-      : null,
+    state: publicState,
+    trendState: publicState,
+    rangeId: range?.rangeId,
+    activeRange: range ? { rangeId: range.rangeId, direction: range.direction, topPrice: range.top.price, bottomPrice: range.bottom.price, topLabel: range.top.label, bottomLabel: range.bottom.label } : null,
+    lockedAnchor: range ? { type: range.direction === 'BULLISH' ? range.bottom.type : range.top.type, price: range.direction === 'BULLISH' ? range.bottom.price : range.top.price, time: range.direction === 'BULLISH' ? range.bottom.candleTime : range.top.candleTime, label: range.direction === 'BULLISH' ? range.bottom.label : range.top.label } : null,
     decisionTrace,
     structureBreakThisCandle: breakId,
-    confirmedPointCreatedThisCandle: pointCreated,
-    engineState,
+    confirmedPointCreatedThisCandle: pointId,
+    engineState: snapshot,
   });
 }
 
-function deduplicatePoints(points: StructurePoint[]): StructurePoint[] {
-  const seenEvent = new Set<string>();
-  const seenCandle = new Map<number, StructurePoint>();
-  const result: StructurePoint[] = [];
-
-  for (const p of points) {
-    if (!assertSingleStructureType(p)) {
-      console.error(`[Invariant Error] Multiple or invalid types in structure point:`, p);
-      continue;
-    }
-    const eventKey = `${p.algorithmVersion}_${p.eventId || p.id}`;
-    if (seenEvent.has(eventKey)) {
-      continue;
-    }
-    seenEvent.add(eventKey);
-
-    // Enforce ONE confirmed marker per candle/timestamp
-    const existingAtCandle = seenCandle.get(p.candleOpenTimeUnix);
-    if (existingAtCandle) {
-      if (existingAtCandle.type !== p.type) {
-        console.error(
-          `[Invariant Violation] Conflicting opposing structure types on same candle (${p.candleOpenTime}): ${existingAtCandle.type} vs ${p.type}. Rejecting second point.`
-        );
-        continue;
-      }
-      continue;
-    }
-
-    seenCandle.set(p.candleOpenTimeUnix, p);
-    result.push(p);
-  }
-
-  return result.sort((a, b) => a.candleOpenTimeUnix - b.candleOpenTimeUnix);
+function toPublicState(state: V6EngineState): StructureState {
+  if (state.includes('BULLISH')) return StructureState.BULLISH;
+  if (state.includes('BEARISH')) return StructureState.BEARISH;
+  return StructureState.UNDEFINED;
 }
 
-function createEmptyV6Result(
-  startTime: number,
+function logItem(candle: NormalizedMarketCandle, eventType: StructureEventLogItem['eventType'], title: string, message: string): StructureEventLogItem {
+  return { id: `v6r3_log_${eventType}_${candle.openTimeUnix}`, candleTime: candle.openTime, candleTimeUnix: candle.openTimeUnix, eventType, title, message };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function emptyResult(
+  started: number,
+  symbol: string,
+  timeframe: string,
   algorithmVersion: string,
-  minCandles: number,
-  minFib: number
+  parameters: StructureParameters,
+  totalCandlesAvailable: number,
+  unclosedCandleExcluded: boolean
 ): StructureDetectionResult {
   return {
-    symbol: 'BTC_USDT',
-    timeframe: '5M',
-    algorithmVersion,
-    parameters: {
-      analysisCandles: 280,
-      initializationSearchCandles: 70,
-      breakConfirmation: 'CLOSE',
-      minimumRetracementCandles: minCandles,
-      minimumRetracementFib: minFib,
-      lookbackCandles: 350,
-      fibTouchMode: 'WICK',
-      algorithmVersion,
-    },
-    structureState: StructureState.UNDEFINED,
-    stateLabel: 'UNDEFINED',
-    totalCandlesAvailable: 0,
-    closedCandlesEvaluated: 0,
-    unclosedCandleExcluded: false,
-    workingWindowStart: null,
-    workingWindowEnd: null,
-    hhCount: 0,
-    hlCount: 0,
-    llCount: 0,
-    lhCount: 0,
-    provisionalCount: 0,
-    totalPointsCount: 0,
-    lastHH: null,
-    lastHL: null,
-    lastLL: null,
-    lastLH: null,
-    activeProvisionalPoint: null,
-    activeRetracement: null,
-    points: [],
-    ranges: [],
-    activeRange: null,
-    internalStructureIgnored: true,
-    structureBreakEvents: [],
-    eventLogs: [],
-    audits: [],
-    rejectedEvents: [],
-    candleReplaySteps: [],
-    executionTimeMs: Date.now() - startTime,
-    detectedAt: new Date().toISOString(),
+    symbol, timeframe, algorithmVersion, parameters,
+    structureState: StructureState.UNDEFINED, stateLabel: 'UNINITIALIZED',
+    totalCandlesAvailable, closedCandlesEvaluated: 0, unclosedCandleExcluded,
+    workingWindowStart: null, workingWindowEnd: null,
+    hhCount: 0, hlCount: 0, lhCount: 0, llCount: 0, provisionalCount: 0, totalPointsCount: 0,
+    lastHH: null, lastHL: null, lastLH: null, lastLL: null, activeProvisionalPoint: null,
+    activeRetracement: null, points: [], ranges: [], activeRange: null,
+    internalStructureIgnored: true, structureBreakEvents: [], eventLogs: [], audits: [], rejectedEvents: [], candleReplaySteps: [],
+    executionTimeMs: Date.now() - started, detectedAt: new Date().toISOString(),
   };
 }

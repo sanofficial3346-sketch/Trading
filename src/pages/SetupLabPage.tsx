@@ -44,6 +44,7 @@ import {
   AuditUserLabel,
   ManualPointType,
   assertSingleStructureType,
+  CURRENT_ALGORITHM_VERSION,
 } from '../../server/setupDetector/structureTypes';
 import { SymbolSearchSelector } from '../components/setupLab/SymbolSearchSelector';
 import { ActiveRetracementCard } from '../components/setupLab/ActiveRetracementCard';
@@ -438,21 +439,19 @@ export const SetupLabPage: React.FC = () => {
           }
         : undefined;
 
-      const [candleData, structureData, labelsData] = await Promise.all([
-        setupLabService.getCandles(selectedSymbol, fetchLimit),
-        setupLabService.getStructure(selectedSymbol, {
+      const [snapshot, labelsData] = await Promise.all([
+        setupLabService.getSnapshot(selectedSymbol, {
           minimumRetracementCandles: minRetracementCandles,
           minimumRetracementFib: minRetracementFib,
           analysisCandles,
           warmUpCandles,
-          legacyPivotOverlay,
           showSequenceNumbers,
-          pivotLeftBars,
-          pivotRightBars,
           manualStart: manualStartParam,
-        }),
+        }, true),
         setupLabService.getAuditLabels(selectedSymbol, '5M'),
       ]);
+      const candleData = snapshot;
+      const structureData = snapshot.structure;
 
       setCandles(candleData.candles);
       setStructure(structureData);
@@ -522,7 +521,7 @@ export const SetupLabPage: React.FC = () => {
     return structure.points.filter((pt) => pt.candleOpenTimeUnix <= currentReplayStep.openTimeUnix);
   }, [structure, isReplayActive, currentReplayStep]);
 
-  const activeAlgorithmVersion = structure?.algorithmVersion || 'STRUCTURE_V6_FIB_QUALIFIED_RANGE';
+  const activeAlgorithmVersion = structure?.algorithmVersion || CURRENT_ALGORITHM_VERSION;
 
   // Confirmed External Structure Points ONLY: strictly HH, HL, LH, LL
   const confirmedExternalPoints = useMemo(() => {
@@ -550,8 +549,7 @@ export const SetupLabPage: React.FC = () => {
       // Must not be provisional
       if (pt.isProvisional) continue;
       // Must belong to active algorithm version
-      const isV6Family = (v?: string) => v === 'STRUCTURE_V6_FIB_QUALIFIED_RANGE' || v === 'STRUCTURE_V6_FIB_QUALIFIED_RANGE_REV2';
-      if (pt.algorithmVersion && pt.algorithmVersion !== activeAlgorithmVersion && !(isV6Family(pt.algorithmVersion) && isV6Family(activeAlgorithmVersion))) continue;
+      if (pt.algorithmVersion !== activeAlgorithmVersion) continue;
       // Must be one of the four allowed types
       if (!allowedTypes.has(pt.type)) continue;
       // Validate hard invariant: single structure type
@@ -663,7 +661,7 @@ export const SetupLabPage: React.FC = () => {
         timeframe: '5M',
         candleOpenTime: activeAuditPoint.candleOpenTime,
         candleOpenTimeUnix: activeAuditPoint.candleOpenTimeUnix,
-        algorithmVersion: activeAuditPoint.algorithmVersion || 'STRUCTURE_V4_WARMUP_LOCKED',
+        algorithmVersion: activeAuditPoint.algorithmVersion || CURRENT_ALGORITHM_VERSION,
         algorithmEventId: activeAuditPoint.auditId || activeAuditRecord?.eventId,
         manualType: labelData.manualType,
         manualPrice: labelData.manualPrice,
@@ -712,7 +710,7 @@ export const SetupLabPage: React.FC = () => {
         timeframe: '5M',
         candleOpenTime: pointData.candleOpenTime,
         candleOpenTimeUnix: pointData.candleOpenTimeUnix,
-        algorithmVersion: 'STRUCTURE_V4_WARMUP_LOCKED',
+        algorithmVersion: CURRENT_ALGORITHM_VERSION,
         manualType: pointData.manualType,
         manualPrice: pointData.manualPrice,
         label: 'MISSING',

@@ -1,6 +1,6 @@
 import { mexcPublicMarketClient, NormalizedMarketCandle } from './mexcPublicMarketClient';
 import { candleRepository } from './candleRepository';
-import { structureEngine } from '../setupDetector/structureEngine';
+import { CURRENT_ALGORITHM_VERSION, structureEngine } from '../setupDetector/structureEngine';
 
 export interface SyncCandleResult {
   symbol: string;
@@ -17,6 +17,7 @@ export interface SyncCandleResult {
 export class CandleService {
   private activePollingIntervals = new Map<string, NodeJS.Timeout>();
   private lastSyncTimes = new Map<string, string>();
+  private readonly publicCandleTtlMs = 12_000;
 
   /**
    * Fetch and persist recent 5-minute candles for a symbol.
@@ -51,7 +52,9 @@ export class CandleService {
 
     // Automatically trigger market structure detection for the updated symbol
     try {
-      await structureEngine.detectAndSaveStructure(cleanSymbol, '5M', 350);
+      await structureEngine.detectAndSaveStructure(cleanSymbol, '5M', 350, {
+        algorithmVersion: CURRENT_ALGORITHM_VERSION,
+      });
     } catch (err) {
       console.warn(`[CandleService] Structure detection auto-run notice for ${cleanSymbol}:`, (err as Error).message);
     }
@@ -87,6 +90,14 @@ export class CandleService {
     }
 
     return stored;
+  }
+
+  public async refreshIfStale(symbol: string, limit: number = 400): Promise<void> {
+    const cleanSymbol = symbol.trim().toUpperCase();
+    const lastSync = this.lastSyncTimes.get(cleanSymbol);
+    if (!lastSync || Date.now() - new Date(lastSync).getTime() >= this.publicCandleTtlMs) {
+      await this.syncCandles(cleanSymbol, limit);
+    }
   }
 
   public getLastSyncTime(symbol: string): string | null {

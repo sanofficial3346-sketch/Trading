@@ -22,6 +22,7 @@ import {
   RetracementBarDetail,
 } from './structureAuditTypes';
 import { structureAuditService } from './structureAuditService';
+import { detectLegacyPivots } from './legacy/pivotOverlay';
 
 export interface WarmUpCandidateEvaluation {
   initialState: StructureState;
@@ -2937,63 +2938,4 @@ export function detectStructureV4WarmUpLocked(
     executionTimeMs: Date.now() - startTime,
     detectedAt: new Date().toISOString(),
   };
-}
-
-function detectLegacyPivots(
-  candles: NormalizedMarketCandle[],
-  params: StructureParameters
-): StructurePoint[] {
-  const left = params.pivotLeftBars ?? 2;
-  const right = params.pivotRightBars ?? 2;
-  const legacy: StructurePoint[] = [];
-
-  for (let i = left; i < candles.length - right; i++) {
-    const c = candles[i];
-    let isHigh = true;
-    let isLow = true;
-
-    for (let l = 1; l <= left; l++) {
-      if (candles[i - l].high >= c.high) isHigh = false;
-      if (candles[i - l].low <= c.low) isLow = false;
-    }
-    for (let r = 1; r <= right; r++) {
-      if (candles[i + r].high >= c.high) isHigh = false;
-      if (candles[i + r].low <= c.low) isLow = false;
-    }
-
-    if (isHigh) {
-      legacy.push({
-        id: `leg_sh_${c.openTimeUnix}`,
-        symbol: c.symbol,
-        timeframe: c.timeframe,
-        candleOpenTime: c.openTime,
-        candleOpenTimeUnix: c.openTimeUnix,
-        type: StructurePointType.SWING_HIGH,
-        price: c.high,
-        strength: StructureStrength.MINOR,
-        algorithmVersion: 'LEGACY_PIVOT_V1',
-        candleIndex: i,
-        detectedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      });
-    }
-    if (isLow) {
-      legacy.push({
-        id: `leg_sl_${c.openTimeUnix}`,
-        symbol: c.symbol,
-        timeframe: c.timeframe,
-        candleOpenTime: c.openTime,
-        candleOpenTimeUnix: c.openTimeUnix,
-        type: StructurePointType.SWING_LOW,
-        price: c.low,
-        strength: StructureStrength.MINOR,
-        algorithmVersion: 'LEGACY_PIVOT_V1',
-        candleIndex: i,
-        detectedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-      });
-    }
-  }
-
-  return legacy;
 }

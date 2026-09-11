@@ -4,6 +4,7 @@ import { candleService } from './candleService';
 import { candleRepository } from './candleRepository';
 import { structureEngine, STRUCTURE_LOOKBACK_CANDLES } from '../setupDetector/structureEngine';
 import { structureAuditService } from '../setupDetector/structureAuditService';
+import { CURRENT_ALGORITHM_VERSION } from '../setupDetector/structureTypes';
 
 export const marketRouter = Router();
 
@@ -107,7 +108,7 @@ marketRouter.get('/structure', async (req: Request, res: Response) => {
     const showSequenceNumbers = req.query.showSequenceNumbers !== 'false';
     const pivotLeftBars = Math.max(1, Math.min(10, parseInt((req.query.pivotLeftBars as string) || '2', 10)));
     const pivotRightBars = Math.max(1, Math.min(10, parseInt((req.query.pivotRightBars as string) || '2', 10)));
-    const algorithmVersion = (req.query.algorithmVersion as string) || undefined;
+    const algorithmVersion = (req.query.algorithmVersion as string) || CURRENT_ALGORITHM_VERSION;
     const showInternalPriceActionDebug = req.query.showInternalPriceActionDebug === 'true';
 
     // Ensure we load enough candles for the requested lookback window + buffer
@@ -156,7 +157,7 @@ marketRouter.post('/structure/detect', async (req: Request, res: Response) => {
     const showSequenceNumbers = req.body.showSequenceNumbers !== false;
     const pivotLeftBars = Math.max(1, Math.min(10, parseInt(req.body.pivotLeftBars || '2', 10)));
     const pivotRightBars = Math.max(1, Math.min(10, parseInt(req.body.pivotRightBars || '2', 10)));
-    const algorithmVersion = req.body.algorithmVersion || undefined;
+    const algorithmVersion = req.body.algorithmVersion || CURRENT_ALGORITHM_VERSION;
     const manualStart = req.body.manualStart || undefined;
     const showInternalPriceActionDebug = req.body.showInternalPriceActionDebug === true;
 
@@ -189,6 +190,46 @@ marketRouter.post('/structure/detect', async (req: Request, res: Response) => {
   }
 });
 
+/** Return candles and V6 structure from the same closed-candle snapshot. */
+marketRouter.post('/setup-lab/snapshot', async (req: Request, res: Response) => {
+  try {
+    const symbol = (req.body.symbol || 'BTC_USDT').trim().toUpperCase();
+    const analysisCandles = Math.max(50, Math.min(1000, Number(req.body.analysisCandles ?? 280)));
+    const warmUpCandles = Math.max(0, Math.min(200, Number(req.body.warmUpCandles ?? 70)));
+    const limit = Math.max(analysisCandles + warmUpCandles + 50, 450);
+    if (req.body.sync !== false) await candleService.refreshIfStale(symbol, limit);
+    const storedCandles = await candleRepository.getCandles(symbol, '5M', limit);
+    const candles = storedCandles.filter((c) => c.isClosed);
+    const structure = structureEngine.detectStructure(candles, {
+      algorithmVersion: CURRENT_ALGORITHM_VERSION,
+      analysisCandles,
+      initializationSearchCandles: warmUpCandles,
+      lookbackCandles: analysisCandles + warmUpCandles,
+      minimumRetracementCandles: Math.max(1, Math.min(20, Number(req.body.minimumRetracementCandles ?? 4))),
+      minimumRetracementFib: Math.max(0.1, Math.min(1, Number(req.body.minimumRetracementFib ?? 0.382))),
+      breakConfirmation: 'CLOSE',
+      fibTouchMode: 'WICK',
+      showSequenceNumbers: req.body.showSequenceNumbers !== false,
+      manualStart: req.body.manualStart || undefined,
+    });
+    res.json({
+      success: true,
+      data: {
+        symbol,
+        timeframe: '5M',
+        count: candles.length,
+        closedCount: candles.filter((c) => c.isClosed).length,
+        hasUnclosed: storedCandles.some((c) => !c.isClosed),
+        lastSync: candleService.getLastSyncTime(symbol),
+        candles,
+        structure,
+      },
+    });
+  } catch (err: unknown) {
+    res.status(500).json({ success: false, error: (err as Error).message || 'Failed to build Setup Lab snapshot' });
+  }
+});
+
 /**
  * GET /api/market/structure/audit-labels
  * Retrieve user manual structure markings and audit flags.
@@ -197,7 +238,7 @@ marketRouter.get('/structure/audit-labels', async (req: Request, res: Response) 
   try {
     const symbol = ((req.query.symbol as string) || 'BTC_USDT').trim().toUpperCase();
     const timeframe = (req.query.timeframe as string) || undefined;
-    const algorithmVersion = (req.query.algorithmVersion as string) || undefined;
+    const algorithmVersion = (req.query.algorithmVersion as string) || CURRENT_ALGORITHM_VERSION;
 
     const labels = await structureAuditService.getAuditLabels(symbol, timeframe, algorithmVersion);
     res.json({
@@ -223,7 +264,7 @@ marketRouter.post('/structure/audit-labels', async (req: Request, res: Response)
       timeframe = '5M',
       candleOpenTime,
       candleOpenTimeUnix,
-      algorithmVersion = 'STRUCTURE_V4_WARMUP_LOCKED',
+      algorithmVersion = CURRENT_ALGORITHM_VERSION,
       algorithmEventId,
       manualType,
       manualPrice,
@@ -302,4 +343,3 @@ marketRouter.post('/structure/divergence', async (req: Request, res: Response) =
     });
   }
 });
-
