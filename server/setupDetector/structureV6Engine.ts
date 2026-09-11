@@ -51,6 +51,8 @@ interface CandidateLeg {
   extreme: Extreme;
   retracement: Extreme | null;
   retracementCandles: number;
+  qualificationReachedAtIndex: number | null;
+  resumptionLevel: number | null;
 }
 
 interface ProposedTransition {
@@ -241,13 +243,28 @@ export function detectStructureV6FibQualifiedRange(
         trace.push(`Same-leg ${candidate.direction} extreme extended to ${candidate.extreme.price}.`);
         eventLogs.push(logItem(candle, 'LEG_EXTENDED', 'Candidate extended', trace[trace.length - 1]));
       } else {
-        updateRetracement(candidate, candle, i);
+        const retracementExtended = updateRetracement(candidate, candle, i);
+        if (retracementExtended) {
+          candidate.qualificationReachedAtIndex = null;
+          candidate.resumptionLevel = candidate.direction === 'BULLISH' ? candle.high : candle.low;
+        }
         engineState = candidate.direction === 'BULLISH' ? 'RETRACING_BULLISH' : 'RETRACING_BEARISH';
         const qualification = qualify(candidate, minimumRetracementCandles, minimumRetracementFib);
         trace.push(
           `Retracement ${qualification.candleCount}/${minimumRetracementCandles} candles, ${(qualification.fibDepth * 100).toFixed(1)}%/${(minimumRetracementFib * 100).toFixed(1)}% Fib.`
         );
-        if (qualification.candleQualified && qualification.fibQualified && candidate.retracement) {
+        const fullyQualified = qualification.candleQualified && qualification.fibQualified;
+        if (fullyQualified && candidate.qualificationReachedAtIndex === null) {
+          candidate.qualificationReachedAtIndex = i;
+          trace.push('Retracement gates satisfied; waiting for body-close resumption before locking the new external range.');
+        }
+        const resumed = candidate.resumptionLevel !== null
+          && candidate.qualificationReachedAtIndex !== null
+          && i > candidate.qualificationReachedAtIndex
+          && (candidate.direction === 'BULLISH'
+            ? candle.close > candidate.resumptionLevel
+            : candle.close < candidate.resumptionLevel);
+        if (fullyQualified && resumed && candidate.retracement) {
           const proposed = proposeTransition(
             activeRange,
             candidate,
@@ -363,16 +380,22 @@ function findNearestQualifiedWarmUpCycle(
     const anchorPrice = direction === 'BULLISH' ? priorLow : priorHigh;
     let extreme: Extreme = { price: direction === 'BULLISH' ? candles[breakIndex].high : candles[breakIndex].low, candle: candles[breakIndex], index: breakIndex };
     let retracement: Extreme | null = null;
+    let qualificationReachedAtIndex: number | null = null;
+    let resumptionLevel: number | null = null;
     for (let i = breakIndex + 1; i < candles.length; i++) {
       const candle = candles[i];
       const isExtension = direction === 'BULLISH' ? candle.high > extreme.price : candle.low < extreme.price;
       if (isExtension) {
         extreme = { price: direction === 'BULLISH' ? candle.high : candle.low, candle, index: i };
         retracement = null;
+        qualificationReachedAtIndex = null;
+        resumptionLevel = null;
         continue;
       }
       if (!retracement || (direction === 'BULLISH' ? candle.low < retracement.price : candle.high > retracement.price)) {
         retracement = { price: direction === 'BULLISH' ? candle.low : candle.high, candle, index: i };
+        qualificationReachedAtIndex = null;
+        resumptionLevel = direction === 'BULLISH' ? candle.high : candle.low;
       }
       const count = i - extreme.index;
       const range = Math.abs(extreme.price - anchorPrice);
@@ -381,7 +404,15 @@ function findNearestQualifiedWarmUpCycle(
           ? (extreme.price - retracement.price) / range
           : (retracement.price - extreme.price) / range
         : 0;
-      if (count >= minimumCandles && depth >= minimumFib) {
+      const fullyQualified = count >= minimumCandles && depth >= minimumFib;
+      if (fullyQualified && qualificationReachedAtIndex === null) {
+        qualificationReachedAtIndex = i;
+      }
+      const resumed = resumptionLevel !== null
+        && qualificationReachedAtIndex !== null
+        && i > qualificationReachedAtIndex
+        && (direction === 'BULLISH' ? candle.close > resumptionLevel : candle.close < resumptionLevel);
+      if (fullyQualified && resumed) {
         completed.push({ direction, extreme, retracement, anchorPrice, confirmationIndex: i, retracementCandles: count, fibDepth: depth });
         break;
       }
@@ -440,6 +471,8 @@ function detectBreak(
       extreme: { price: direction === 'BULLISH' ? candle.high : candle.low, candle, index },
       retracement: null,
       retracementCandles: 0,
+      qualificationReachedAtIndex: null,
+      resumptionLevel: null,
     },
   };
 }
@@ -452,15 +485,20 @@ function extendCandidate(candidate: CandidateLeg, candle: NormalizedMarketCandle
   candidate.extreme = { price: candidate.direction === 'BULLISH' ? candle.high : candle.low, candle, index };
   candidate.retracement = null;
   candidate.retracementCandles = 0;
+  candidate.qualificationReachedAtIndex = null;
+  candidate.resumptionLevel = null;
   return true;
 }
 
-function updateRetracement(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number): void {
+function updateRetracement(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number): boolean {
   const price = candidate.direction === 'BULLISH' ? candle.low : candle.high;
+  let extended = false;
   if (!candidate.retracement || (candidate.direction === 'BULLISH' ? price < candidate.retracement.price : price > candidate.retracement.price)) {
     candidate.retracement = { price, candle, index };
+    extended = true;
   }
   candidate.retracementCandles = index - candidate.extreme.index;
+  return extended;
 }
 
 function qualify(candidate: CandidateLeg, requiredCandles: number, requiredFib: number) {
