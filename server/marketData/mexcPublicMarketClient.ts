@@ -125,13 +125,14 @@ export class MexcPublicMarketClient {
     }
 
     const raw = payload.data;
-    const count = raw.time.length;
+    const times = raw.time!;
+    const count = times.length;
     const candlesMap = new Map<number, NormalizedMarketCandle>();
     const nowMs = Date.now();
     const candleDurationMs = 5 * 60 * 1000; // 5 minutes in milliseconds
 
     for (let i = 0; i < count; i++) {
-      const rawTime = raw.time[i];
+      const rawTime = times[i];
       if (typeof rawTime !== 'number' || isNaN(rawTime)) continue;
 
       const candle = this.normalizeCandleData(

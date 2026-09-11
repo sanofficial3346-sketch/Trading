@@ -64,6 +64,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -96,6 +97,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -125,6 +127,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -153,6 +156,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -173,6 +177,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -194,6 +199,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -212,6 +218,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -232,6 +239,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -262,6 +270,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bullishSeed,
     });
 
@@ -289,6 +298,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bearishSeed,
     });
 
@@ -307,6 +317,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bearishSeed,
     });
 
@@ -324,6 +335,7 @@ describe('Deterministic Retracement-Qualified Structure Engine (V2)', () => {
     const result = structureEngine.detectStructure(candles, {
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
+      algorithmVersion: 'STRUCTURE_V2_RETRACEMENT',
       initialSeed: bearishSeed,
     });
 
