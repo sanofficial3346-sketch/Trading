@@ -1,0 +1,7 @@
+{
+  "name": "TradeMate",
+  "description": "High-fidelity personal trading analytics platform and institutional performance terminal.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

@@ -1,0 +1,679 @@
+// TradeMate PostgreSQL Schema (Prisma ORM)
+// Production-ready relational schema separating raw exchange data from processed TradeMate metrics
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------
+
+enum AccountType {
+  SPOT
+  FUTURES
+  MARGIN
+}
+
+enum MarketCategory {
+  CRYPTO
+  GOLD
+  SILVER
+  COPPER
+  OTHER
+}
+
+enum Direction {
+  LONG
+  SHORT
+}
+
+enum TradeStatus {
+  OPEN
+  CLOSED
+}
+
+enum FillRole {
+  ENTRY
+  EXIT
+  FEE
+  OTHER
+}
+
+enum EventImportance {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum NoTradeWindowStatus {
+  UPCOMING
+  ACTIVE
+  COMPLETED
+}
+
+enum ViolationType {
+  NEWS_BLACKOUT_ENTRY
+  ENTERED_AFTER_MAX_DAILY_LOSSES
+  OVER_RISK_LIMIT
+  REVENGE_TRADING_DETECTED
+  OTHER
+}
+
+enum PeriodType {
+  DAILY
+  WEEKLY
+  MONTHLY
+  YEARLY
+  ALL_TIME
+}
+
+enum PatternType {
+  SESSION
+  TIME_OF_DAY
+  DAY_OF_WEEK
+  SYMBOL
+  MARKET_CATEGORY
+  DIRECTION
+  HOLDING_TIME
+  AFTER_LOSS
+  AFTER_WIN
+  CONSECUTIVE_LOSS
+  STRATEGY
+  NEWS_EVENT
+  RISK_SIZE
+}
+
+enum SyncType {
+  ORDERS
+  FILLS
+  BALANCES
+  FUNDING
+  FULL_HISTORY
+}
+
+enum SyncStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum AttachmentType {
+  PRE_TRADE_SCREENSHOT
+  POST_TRADE_SCREENSHOT
+  OTHER
+}
+
+// ---------------------------------------------------------
+// CORE & ACCOUNT TABLES
+// ---------------------------------------------------------
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  email     String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tradingAccounts    TradingAccount[]
+  strategies         Strategy[]
+  economicEventRules EconomicEventRule[]
+
+  @@map("users")
+}
+
+model Exchange {
+  id        String   @id @default(uuid())
+  name      String
+  code      String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tradingAccounts TradingAccount[]
+
+  @@map("exchanges")
+}
+
+model TradingAccount {
+  id                String      @id @default(uuid())
+  userId            String      @map("user_id")
+  exchangeId        String      @map("exchange_id")
+  accountName       String      @map("account_name")
+  accountType       AccountType @map("account_type")
+  baseCurrency      String      @default("USDT") @map("base_currency")
+  externalAccountId String?     @map("external_account_id")
+  isActive          Boolean     @default(true) @map("is_active")
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange Exchange @relation(fields: [exchangeId], references: [id], onDelete: Restrict)
+
+  rawExchangeOrders   RawExchangeOrder[]
+  rawExchangeFills    RawExchangeFill[]
+  fundingTransactions FundingTransaction[]
+  balanceTransactions BalanceTransaction[]
+  trades              Trade[]
+  equitySnapshots     EquitySnapshot[]
+  dailyPerformance    DailyPerformance[]
+  analyticsSnapshots  AnalyticsSnapshot[]
+  detectedPatterns    DetectedPattern[]
+  syncJobs            SyncJob[]
+  importBatches       ImportBatch[]
+
+  @@index([userId])
+  @@index([exchangeId])
+  @@map("trading_accounts")
+}
+
+// ---------------------------------------------------------
+// RAW IMMUTABLE EXCHANGE TABLES
+// ---------------------------------------------------------
+
+model RawExchangeOrder {
+  id                String    @id @default(uuid())
+  tradingAccountId  String    @map("trading_account_id")
+  exchangeOrderId   String    @map("exchange_order_id")
+  symbol            String
+  side              String
+  orderType         String    @map("order_type")
+  status            String
+  price             Decimal   @db.Decimal(18, 8)
+  quantity          Decimal   @db.Decimal(18, 8)
+  filledQuantity    Decimal   @db.Decimal(18, 8) @map("filled_quantity")
+  averagePrice      Decimal?  @db.Decimal(18, 8) @map("average_price")
+  reduceOnly        Boolean   @default(false) @map("reduce_only")
+  positionSide      String?   @map("position_side")
+  leverage          Int?
+  exchangeCreatedAt DateTime  @map("exchange_created_at")
+  exchangeUpdatedAt DateTime? @map("exchange_updated_at")
+  rawPayload        Json      @map("raw_payload")
+  syncedAt          DateTime  @default(now()) @map("synced_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([tradingAccountId, exchangeOrderId])
+  @@index([tradingAccountId, symbol])
+  @@map("raw_exchange_orders")
+}
+
+model RawExchangeFill {
+  id                String    @id @default(uuid())
+  tradingAccountId  String    @map("trading_account_id")
+  exchangeFillId    String    @map("exchange_fill_id")
+  exchangeOrderId   String?   @map("exchange_order_id")
+  symbol            String
+  side              String
+  price             Decimal   @db.Decimal(18, 8)
+  quantity          Decimal   @db.Decimal(18, 8)
+  quoteQuantity     Decimal?  @db.Decimal(18, 8) @map("quote_quantity")
+  fee               Decimal   @db.Decimal(18, 8)
+  feeCurrency       String?   @map("fee_currency")
+  realizedPnl       Decimal?  @db.Decimal(18, 8) @map("realized_pnl")
+  positionSide      String?   @map("position_side")
+  liquidityType     String?   @map("liquidity_type")
+  exchangeTimestamp DateTime  @map("exchange_timestamp")
+  rawPayload        Json      @map("raw_payload")
+  syncedAt          DateTime  @default(now()) @map("synced_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  tradeFills     TradeFill[]
+
+  @@unique([tradingAccountId, exchangeFillId])
+  @@index([tradingAccountId])
+  @@index([symbol])
+  @@index([exchangeTimestamp])
+  @@map("raw_exchange_fills")
+}
+
+model FundingTransaction {
+  id                String   @id @default(uuid())
+  tradingAccountId  String   @map("trading_account_id")
+  externalId        String?  @map("external_id")
+  symbol            String
+  amount            Decimal  @db.Decimal(18, 8)
+  currency          String
+  fundingRate       Decimal? @db.Decimal(12, 8) @map("funding_rate")
+  exchangeTimestamp DateTime @map("exchange_timestamp")
+  rawPayload        Json     @map("raw_payload")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId, symbol])
+  @@index([exchangeTimestamp])
+  @@map("funding_transactions")
+}
+
+model BalanceTransaction {
+  id                String   @id @default(uuid())
+  tradingAccountId  String   @map("trading_account_id")
+  externalId        String?  @map("external_id")
+  transactionType   String   @map("transaction_type")
+  asset             String
+  amount            Decimal  @db.Decimal(18, 8)
+  exchangeTimestamp DateTime @map("exchange_timestamp")
+  rawPayload        Json     @map("raw_payload")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId, asset])
+  @@index([exchangeTimestamp])
+  @@map("balance_transactions")
+}
+
+// ---------------------------------------------------------
+// PROCESSED TRADES & JOURNAL
+// ---------------------------------------------------------
+
+model Trade {
+  id                 String         @id @default(uuid())
+  tradingAccountId   String         @map("trading_account_id")
+  symbol             String
+  marketCategory     MarketCategory @map("market_category")
+  direction          Direction
+  status             TradeStatus
+  openedAt           DateTime       @map("opened_at")
+  closedAt           DateTime?      @map("closed_at")
+  averageEntryPrice  Decimal        @db.Decimal(18, 8) @map("average_entry_price")
+  averageExitPrice   Decimal?       @db.Decimal(18, 8) @map("average_exit_price")
+  entryQuantity      Decimal        @db.Decimal(18, 8) @map("entry_quantity")
+  exitQuantity       Decimal?       @db.Decimal(18, 8) @map("exit_quantity")
+  grossPnl           Decimal?       @db.Decimal(18, 8) @map("gross_pnl")
+  netPnl             Decimal?       @db.Decimal(18, 8) @map("net_pnl")
+  feesTotal          Decimal        @default(0) @db.Decimal(18, 8) @map("fees_total")
+  fundingTotal       Decimal        @default(0) @db.Decimal(18, 8) @map("funding_total")
+  returnPercent      Decimal?       @db.Decimal(8, 4) @map("return_percent")
+  riskAmount         Decimal?       @db.Decimal(18, 8) @map("risk_amount")
+  riskPercent        Decimal?       @db.Decimal(6, 4) @map("risk_percent")
+  rMultiple          Decimal?       @db.Decimal(8, 4) @map("r_multiple")
+  leverage           Int?
+  holdingSeconds     Int?           @map("holding_seconds")
+  strategyId         String?        @map("strategy_id")
+  setupId            String?        @map("setup_id")
+  session            String?
+  tradeNumberOfDay   Int?           @map("trade_number_of_day")
+  followedRules      Boolean?       @map("followed_rules")
+  emotion            String?
+  confidenceScore    Int?           @map("confidence_score")
+  notes              String?
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+
+  tradingAccount     TradingAccount       @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+  strategy           Strategy?            @relation(fields: [strategyId], references: [id], onDelete: SetNull)
+  setup              TradeSetup?          @relation(fields: [setupId], references: [id], onDelete: SetNull)
+  tradeFills         TradeFill[]
+  journalEntry       TradeJournalEntry?
+  attachments        TradeAttachment[]
+  ruleViolations     TradeRuleViolation[]
+
+  @@index([tradingAccountId])
+  @@index([symbol])
+  @@index([openedAt])
+  @@index([closedAt])
+  @@index([strategyId])
+  @@index([direction])
+  @@index([session])
+  @@map("trades")
+}
+
+model TradeFill {
+  id                String   @id @default(uuid())
+  tradeId           String   @map("trade_id")
+  rawExchangeFillId String   @map("raw_exchange_fill_id")
+  fillRole          FillRole @map("fill_role")
+  quantityAllocated Decimal  @db.Decimal(18, 8) @map("quantity_allocated")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  trade           Trade           @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  rawExchangeFill RawExchangeFill @relation(fields: [rawExchangeFillId], references: [id], onDelete: Restrict)
+
+  @@index([tradeId])
+  @@index([rawExchangeFillId])
+  @@map("trade_fills")
+}
+
+model Strategy {
+  id          String   @id @default(uuid())
+  userId      String   @map("user_id")
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades Trade[]
+  setups TradeSetup[]
+
+  @@index([userId])
+  @@map("strategies")
+}
+
+model TradeSetup {
+  id          String   @id @default(uuid())
+  strategyId  String?  @map("strategy_id")
+  name        String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  strategy Strategy? @relation(fields: [strategyId], references: [id], onDelete: Cascade)
+  trades   Trade[]
+
+  @@index([strategyId])
+  @@map("trade_setups")
+}
+
+model TradeJournalEntry {
+  id              String   @id @default(uuid())
+  tradeId         String   @unique @map("trade_id")
+  preTradeNotes   String?  @map("pre_trade_notes")
+  postTradeNotes  String?  @map("post_trade_notes")
+  entryReason     String?  @map("entry_reason")
+  exitReason      String?  @map("exit_reason")
+  mistakeCategory String?  @map("mistake_category")
+  emotionBefore   String?  @map("emotion_before")
+  emotionAfter    String?  @map("emotion_after")
+  ruleFollowed    Boolean? @map("rule_followed")
+  confidenceScore Int?     @map("confidence_score")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  trade Trade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+
+  @@map("trade_journal_entries")
+}
+
+model TradeAttachment {
+  id             String         @id @default(uuid())
+  tradeId        String         @map("trade_id")
+  attachmentType AttachmentType @map("attachment_type")
+  fileUrl        String         @map("file_url")
+  caption        String?
+  createdAt      DateTime       @default(now()) @map("created_at")
+
+  trade Trade @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+
+  @@index([tradeId])
+  @@map("trade_attachments")
+}
+
+// ---------------------------------------------------------
+// EQUITY & HISTORICAL PERFORMANCE
+// ---------------------------------------------------------
+
+model EquitySnapshot {
+  id                    String   @id @default(uuid())
+  tradingAccountId      String   @map("trading_account_id")
+  timestamp             DateTime
+  equity                Decimal  @db.Decimal(18, 8)
+  walletBalance         Decimal? @db.Decimal(18, 8) @map("wallet_balance")
+  availableBalance      Decimal? @db.Decimal(18, 8) @map("available_balance")
+  unrealizedPnl         Decimal? @db.Decimal(18, 8) @map("unrealized_pnl")
+  realizedPnlCumulative Decimal? @db.Decimal(18, 8) @map("realized_pnl_cumulative")
+  source                String   @default("CALCULATED") // API, CALCULATED, IMPORT
+  createdAt             DateTime @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId, timestamp])
+  @@map("equity_snapshots")
+}
+
+model DailyPerformance {
+  id                 String   @id @default(uuid())
+  tradingAccountId   String   @map("trading_account_id")
+  date               String // YYYY-MM-DD
+  startingEquity     Decimal  @db.Decimal(18, 8) @map("starting_equity")
+  endingEquity       Decimal  @db.Decimal(18, 8) @map("ending_equity")
+  grossPnl           Decimal  @db.Decimal(18, 8) @map("gross_pnl")
+  netPnl             Decimal  @db.Decimal(18, 8) @map("net_pnl")
+  fees               Decimal  @db.Decimal(18, 8)
+  funding            Decimal  @db.Decimal(18, 8)
+  returnPercent      Decimal  @db.Decimal(8, 4) @map("return_percent")
+  tradesCount        Int      @map("trades_count")
+  wins               Int
+  losses             Int
+  winRate            Decimal  @db.Decimal(6, 2) @map("win_rate")
+  grossProfit        Decimal  @db.Decimal(18, 8) @map("gross_profit")
+  grossLoss          Decimal  @db.Decimal(18, 8) @map("gross_loss")
+  profitFactor       Decimal? @db.Decimal(8, 4) @map("profit_factor")
+  averageR           Decimal? @db.Decimal(8, 4) @map("average_r")
+  maxDrawdownPercent Decimal? @db.Decimal(6, 2) @map("max_drawdown_percent")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@unique([tradingAccountId, date])
+  @@index([tradingAccountId])
+  @@map("daily_performance")
+}
+
+// ---------------------------------------------------------
+// ECONOMIC EVENTS & NO-TRADE RULES
+// ---------------------------------------------------------
+
+model EconomicEvent {
+  id              String          @id @default(uuid())
+  externalEventId String?         @map("external_event_id")
+  source          String          @default("FOREX_FACTORY")
+  country         String
+  currency        String?
+  eventName       String          @map("event_name")
+  category        String?
+  importance      EventImportance
+  scheduledAt     DateTime        @map("scheduled_at")
+  actual          String?
+  forecast        String?
+  previous        String?
+  unit            String?
+  rawPayload      Json?           @map("raw_payload")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+
+  noTradeWindows  NoTradeWindow[]
+  ruleViolations  TradeRuleViolation[]
+
+  @@index([scheduledAt])
+  @@index([importance])
+  @@index([eventName])
+  @@map("economic_events")
+}
+
+model EconomicEventRule {
+  id               String           @id @default(uuid())
+  userId           String           @map("user_id")
+  eventNamePattern String           @map("event_name_pattern")
+  importanceFilter EventImportance? @map("importance_filter")
+  minutesBefore    Int              @map("minutes_before")
+  minutesAfter     Int              @map("minutes_after")
+  isEnabled        Boolean          @default(true) @map("is_enabled")
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  noTradeWindows NoTradeWindow[]
+
+  @@index([userId])
+  @@map("economic_event_rules")
+}
+
+model NoTradeWindow {
+  id              String              @id @default(uuid())
+  economicEventId String              @map("economic_event_id")
+  ruleId          String              @map("rule_id")
+  startsAt        DateTime            @map("starts_at")
+  endsAt          DateTime            @map("ends_at")
+  status          NoTradeWindowStatus @default(UPCOMING)
+  createdAt       DateTime            @default(now()) @map("created_at")
+
+  economicEvent EconomicEvent     @relation(fields: [economicEventId], references: [id], onDelete: Cascade)
+  rule          EconomicEventRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([startsAt, endsAt])
+  @@map("no_trade_windows")
+}
+
+model TradeRuleViolation {
+  id              String        @id @default(uuid())
+  tradeId         String        @map("trade_id")
+  violationType   ViolationType @map("violation_type")
+  economicEventId String?       @map("economic_event_id")
+  description     String
+  severity        String // LOW, MEDIUM, HIGH, CRITICAL
+  detectedAt      DateTime      @default(now()) @map("detected_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+
+  trade         Trade          @relation(fields: [tradeId], references: [id], onDelete: Cascade)
+  economicEvent EconomicEvent? @relation(fields: [economicEventId], references: [id], onDelete: SetNull)
+
+  @@index([tradeId])
+  @@index([violationType])
+  @@map("trade_rule_violations")
+}
+
+// ---------------------------------------------------------
+// DETERMINISTIC ANALYTICS & PATTERN DETECTION
+// ---------------------------------------------------------
+
+model AnalyticsSnapshot {
+  id               String     @id @default(uuid())
+  tradingAccountId String     @map("trading_account_id")
+  periodType       PeriodType @map("period_type")
+  periodStart      DateTime   @map("period_start")
+  periodEnd        DateTime   @map("period_end")
+  metrics          Json
+  calculatedAt     DateTime   @default(now()) @map("calculated_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId, periodType])
+  @@map("analytics_snapshots")
+}
+
+model DetectedPattern {
+  id               String      @id @default(uuid())
+  tradingAccountId String      @map("trading_account_id")
+  patternType      PatternType @map("pattern_type")
+  title            String
+  description      String
+  sampleSize       Int         @map("sample_size")
+  winRate          Decimal?    @db.Decimal(6, 2) @map("win_rate")
+  expectancyR      Decimal?    @db.Decimal(8, 4) @map("expectancy_r")
+  profitFactor     Decimal?    @db.Decimal(8, 4) @map("profit_factor")
+  netPnl           Decimal?    @db.Decimal(18, 8) @map("net_pnl")
+  confidenceScore  Int?        @map("confidence_score")
+  isPositive       Boolean     @map("is_positive")
+  periodStart      DateTime?   @map("period_start")
+  periodEnd        DateTime?   @map("period_end")
+  metadata         Json?
+  detectedAt       DateTime    @default(now()) @map("detected_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId])
+  @@index([patternType])
+  @@index([detectedAt])
+  @@map("detected_patterns")
+}
+
+// ---------------------------------------------------------
+// SYNC JOBS & IMPORT BATCHES
+// ---------------------------------------------------------
+
+model SyncJob {
+  id               String     @id @default(uuid())
+  tradingAccountId String     @map("trading_account_id")
+  syncType         SyncType   @map("sync_type")
+  status           SyncStatus @default(PENDING)
+  startedAt        DateTime   @default(now()) @map("started_at")
+  completedAt      DateTime?  @map("completed_at")
+  recordsReceived  Int        @default(0) @map("records_received")
+  recordsInserted  Int        @default(0) @map("records_inserted")
+  recordsSkipped   Int        @default(0) @map("records_skipped")
+  errorMessage     String?    @map("error_message")
+  metadata         Json?
+  createdAt        DateTime   @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId, status])
+  @@map("sync_jobs")
+}
+
+model ImportBatch {
+  id               String     @id @default(uuid())
+  tradingAccountId String     @map("trading_account_id")
+  source           String     @default("MANUAL_CSV")
+  fileName         String?    @map("file_name")
+  status           SyncStatus @default(PENDING)
+  recordsTotal     Int        @default(0) @map("records_total")
+  recordsSuccess   Int        @default(0) @map("records_success")
+  recordsFailed    Int        @default(0) @map("records_failed")
+  startedAt        DateTime   @default(now()) @map("started_at")
+  completedAt      DateTime?  @map("completed_at")
+  createdAt        DateTime   @default(now()) @map("created_at")
+
+  tradingAccount TradingAccount @relation(fields: [tradingAccountId], references: [id], onDelete: Cascade)
+
+  @@index([tradingAccountId])
+  @@map("import_batches")
+}
+
+// ---------------------------------------------------------
+// PUBLIC MARKET DATA & SETUP LAB STRUCTURE DETECTION
+// ---------------------------------------------------------
+
+model MarketCandle {
+  id         String   @id @default(uuid())
+  symbol     String
+  timeframe  String   @default("5M")
+  openTime   DateTime @map("open_time")
+  open       Decimal  @db.Decimal(24, 8)
+  high       Decimal  @db.Decimal(24, 8)
+  low        Decimal  @db.Decimal(24, 8)
+  close      Decimal  @db.Decimal(24, 8)
+  volume     Decimal? @db.Decimal(24, 8)
+  amount     Decimal? @db.Decimal(24, 8)
+  isClosed   Boolean  @default(true) @map("is_closed")
+  source     String   @default("MEXC_PUBLIC")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([symbol, timeframe, openTime])
+  @@index([symbol])
+  @@index([timeframe])
+  @@index([openTime])
+  @@map("market_candles")
+}
+
+model MarketStructurePoint {
+  id               String   @id @default(uuid())
+  symbol           String
+  timeframe        String   @default("5M")
+  candleOpenTime   DateTime @map("candle_open_time")
+  type             String   // "SWING_HIGH" | "SWING_LOW"
+  price            Decimal  @db.Decimal(24, 8)
+  strength         String?  // "MINOR" | "INTERMEDIATE" | "MAJOR"
+  algorithmVersion String   @default("STRUCTURE_V1") @map("algorithm_version")
+  parameters       Json?
+  detectedAt       DateTime @default(now()) @map("detected_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@unique([symbol, timeframe, candleOpenTime, type, algorithmVersion])
+  @@index([symbol, timeframe])
+  @@index([candleOpenTime])
+  @@map("market_structure_points")
+}
