@@ -9,7 +9,9 @@
     "start": "node dist/server.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "bun test server/setupDetector/__tests__/*.test.ts src/tests/*.test.ts",
+    "test:v6": "bun test server/setupDetector/__tests__/structureV6Engine.test.ts && bun test server/setupDetector/__tests__/structureV6ProductionPaths.test.ts && bun test server/setupDetector/__tests__/structureV6GoldenFixtures.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

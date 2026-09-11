@@ -102,8 +102,8 @@ export class StructureRepository implements IStructureRepository {
 
   public async getPoints(
     symbol: string,
-    timeframe: string = '5M',
-    algorithmVersion: string = 'STRUCTURE_V1'
+    timeframe: string,
+    algorithmVersion: string
   ): Promise<StructurePoint[]> {
     const prisma = getPrismaClientSafe();
     const health = await checkDatabaseHealth();

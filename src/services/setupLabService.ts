@@ -4,6 +4,7 @@ import {
   StructurePoint,
   StructureAuditLabelRecord,
   FirstDivergenceAnalysis,
+  CURRENT_ALGORITHM_VERSION,
 } from '../../server/setupDetector/structureTypes';
 
 export interface SetupLabCandleData {
@@ -14,6 +15,10 @@ export interface SetupLabCandleData {
   hasUnclosed: boolean;
   lastSync: string | null;
   candles: NormalizedMarketCandle[];
+}
+
+export interface SetupLabSnapshotData extends SetupLabCandleData {
+  structure: StructureDetectionResult;
 }
 
 export class SetupLabService {
@@ -122,7 +127,7 @@ export class SetupLabService {
     const showSequenceNumbers = params.showSequenceNumbers ?? true;
     const left = params.pivotLeftBars ?? 2;
     const right = params.pivotRightBars ?? 2;
-    const versionParam = params.algorithmVersion ? `&algorithmVersion=${encodeURIComponent(params.algorithmVersion)}` : '';
+    const versionParam = `&algorithmVersion=${encodeURIComponent(params.algorithmVersion ?? CURRENT_ALGORITHM_VERSION)}`;
 
     const res = await fetch(
       `/api/market/structure?symbol=${encodeURIComponent(
@@ -139,12 +144,28 @@ export class SetupLabService {
     return json.data;
   }
 
+  public async getSnapshot(
+    symbol: string,
+    params: Parameters<SetupLabService['getStructure']>[1],
+    sync: boolean = true
+  ): Promise<SetupLabSnapshotData> {
+    const res = await fetch('/api/market/setup-lab/snapshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ symbol, ...params, algorithmVersion: CURRENT_ALGORITHM_VERSION, sync }),
+    });
+    if (!res.ok) throw new Error(`Failed to fetch Setup Lab snapshot: HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.success || !json.data) throw new Error(json.error || 'Invalid Setup Lab snapshot');
+    return json.data;
+  }
+
   /**
    * Fetch user manual structure labels / audit flags
    */
-  public async getAuditLabels(symbol: string, timeframe: string = '5M'): Promise<StructureAuditLabelRecord[]> {
+  public async getAuditLabels(symbol: string, timeframe: string = '5M', algorithmVersion: string = CURRENT_ALGORITHM_VERSION): Promise<StructureAuditLabelRecord[]> {
     try {
-      const res = await fetch(`/api/market/structure/audit-labels?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}`);
+      const res = await fetch(`/api/market/structure/audit-labels?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&algorithmVersion=${encodeURIComponent(algorithmVersion)}`);
       if (res.ok) {
         const json = await res.json();
         if (json.success && Array.isArray(json.data)) {
