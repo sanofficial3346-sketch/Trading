@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+// Keep these regressions in the existing test:v6 entry point without changing package scripts.
+import './structureV6ExternalRange.cases';
 import { detectStructureV6FibQualifiedRange } from '../structureV6Engine';
 import {
   ALGORITHM_VERSION_V6_REV3,
@@ -33,6 +35,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('confirms exactly one HH+HL bullish continuation pair using retracement low', () => {
     const { candles, seed } = bullishSeed();
     candles.push(candle(2, 99, 110, 98, 105), candle(3, 105, 109, 105, 107), candle(4, 107, 108, 103, 104), candle(5, 104, 106, 100, 102), candle(6, 102, 104, 98, 100), candle(7, 100, 106, 99, 105));
+    // The old micro-resumption candle leaves the external pair unresolved.
+    assert.equal(run(candles, seed).points.length, 2);
+    candles.push(candle(8, 105, 112, 104, 111)); // later close through the preceding expansion extreme
     const result = run(candles, seed);
     assert.deepEqual(result.points.slice(-2).map((p) => p.type), [StructurePointType.HH, StructurePointType.HL]);
     assert.equal(result.points.at(-2)?.price, 110);
@@ -44,6 +49,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('confirms exactly one LL+LH bearish continuation pair using retracement high', () => {
     const { candles, seed } = bearishSeed();
     candles.push(candle(2, 81, 82, 70, 75), candle(3, 74, 74, 71, 72), candle(4, 72, 77, 71, 75), candle(5, 75, 80, 74, 78), candle(6, 78, 82, 77, 80), candle(7, 80, 81, 75, 76));
+    // The old micro-resumption candle leaves the external pair unresolved.
+    assert.equal(run(candles, seed).points.length, 2);
+    candles.push(candle(8, 76, 77, 68, 69)); // later close through the preceding expansion extreme
     const result = run(candles, seed);
     assert.deepEqual(result.points.slice(-2).map((p) => p.type), [StructurePointType.LL, StructurePointType.LH]);
     assert.equal(result.points.at(-2)?.price, 70);
@@ -55,6 +63,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('transitions bearish to bullish only after a close above LH and qualification', () => {
     const { candles, seed } = bearishSeed();
     candles.push(candle(2, 99, 112, 98, 105), candle(3, 105, 110, 104, 108), candle(4, 108, 109, 101, 103), candle(5, 103, 106, 98, 100), candle(6, 100, 103, 96, 99), candle(7, 99, 108, 98, 104));
+    // The old micro-resumption candle leaves the external pair unresolved.
+    assert.equal(run(candles, seed).points.length, 2);
+    candles.push(candle(8, 104, 115, 103, 113)); // later close through the preceding expansion extreme
     const result = run(candles, seed);
     assert.deepEqual(result.points.slice(-2).map((p) => p.type), [StructurePointType.HH, StructurePointType.HL]);
     assert.equal(result.activeRange?.direction, 'BULLISH');
@@ -63,6 +74,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('transitions bullish to bearish only after a close below HL and qualification', () => {
     const { candles, seed } = bullishSeed();
     candles.push(candle(2, 81, 82, 68, 75), candle(3, 74, 74, 69, 71), candle(4, 71, 78, 70, 75), candle(5, 75, 82, 74, 79), candle(6, 79, 84, 78, 81), candle(7, 81, 82, 75, 77));
+    // The old micro-resumption candle leaves the external pair unresolved.
+    assert.equal(run(candles, seed).points.length, 2);
+    candles.push(candle(8, 77, 78, 65, 67)); // later close through the preceding expansion extreme
     const result = run(candles, seed);
     assert.deepEqual(result.points.slice(-2).map((p) => p.type), [StructurePointType.LL, StructurePointType.LH]);
     assert.equal(result.activeRange?.direction, 'BEARISH');
@@ -114,6 +128,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
     const { candles, seed } = bullishSeed();
     const exact = 110 - 0.382 * (110 - 80);
     candles.push(candle(2, 101, 110, 100, 108), candle(3, 108, 109, 105, 107), candle(4, 107, 108, 103, 105), candle(5, 105, 106, 101, 103), candle(6, 103, 104, exact, 102), candle(7, 102, 106, 100, 105));
+    assert.equal(run(candles, seed).points.length, 2);
+    assert.equal(run(candles, seed).activeRetracement?.isFullyQualified, true);
+    candles.push(candle(8, 105, 112, 104, 111));
     assert.equal(run(candles, seed).points.length, 4);
   });
 
@@ -126,6 +143,8 @@ describe('V6 REV3 authoritative structure state machine', () => {
     assert.equal(extending.activeRetracement?.candidatePrice, 115);
 
     candles.push(candle(5, 113, 114, 108, 110), candle(6, 110, 112, 104, 106), candle(7, 106, 109, 100, 103), candle(8, 103, 106, 95, 100), candle(9, 100, 110, 98, 107));
+    assert.equal(run(candles, seed).points.length, 2);
+    candles.push(candle(10, 107, 118, 106, 116));
     const result = run(candles, seed);
     assert.equal(result.points.at(-2)?.price, 115);
     assert.equal(result.points.at(-1)?.price, 95);
@@ -170,6 +189,8 @@ describe('V6 REV3 authoritative structure state machine', () => {
     assert.equal(stillRetracing.activeRetracement?.currentRetracementExtremePrice, 93);
 
     candles.push(candle(16, 94, 101, 94, 99, 'XAU_USDT')); // closes above the last retracement candle high
+    assert.equal(run(candles, seed).points.length, 2); // micro resumption cannot confirm
+    candles.push(candle(17, 99, 112, 98, 111, 'XAU_USDT')); // close through HH=110
     const confirmed = run(candles, seed);
     assert.equal(confirmed.points.length, 4);
     assert.deepEqual(confirmed.points.slice(-2).map((point) => [point.type, point.price]), [
@@ -179,9 +200,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
     assert.equal(confirmed.ranges?.filter((range) => range.status === 'ACTIVE').length, 1);
 
     candles.push(
-      candle(17, 99, 108, 96, 106, 'XAU_USDT'),
-      candle(18, 106, 109, 95, 97, 'XAU_USDT'),
-      candle(19, 97, 107, 94, 104, 'XAU_USDT'),
+      candle(18, 99, 108, 96, 106, 'XAU_USDT'),
+      candle(19, 106, 109, 95, 97, 'XAU_USDT'),
+      candle(20, 97, 107, 94, 104, 'XAU_USDT'),
     );
     const rightEdgeInternals = run(candles, seed);
     assert.deepEqual(rightEdgeInternals.points, confirmed.points);
@@ -198,7 +219,9 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('never emits opposing labels on one event or timestamp', () => {
     const { candles, seed } = bullishSeed();
     candles.push(candle(2, 101, 110, 99, 108), candle(3, 108, 109, 104, 105), candle(4, 105, 107, 102, 104), candle(5, 104, 106, 100, 102), candle(6, 102, 104, 98, 100), candle(7, 100, 106, 99, 105));
+    candles.push(candle(8, 105, 112, 104, 111));
     const result = run(candles, seed);
+    assert.equal(result.points.length, 4);
     assert.equal(new Set(result.points.map((p) => p.eventId)).size, result.points.length);
     assert.equal(new Set(result.points.map((p) => p.candleOpenTimeUnix)).size, result.points.length);
   });
@@ -206,6 +229,8 @@ describe('V6 REV3 authoritative structure state machine', () => {
   it('is deterministic across repeated runs', () => {
     const { candles, seed } = bearishSeed();
     candles.push(candle(2, 79, 80, 70, 75), candle(3, 74, 75, 71, 73), candle(4, 73, 78, 72, 76), candle(5, 76, 80, 75, 78), candle(6, 78, 82, 77, 80), candle(7, 80, 81, 75, 76));
+    candles.push(candle(8, 76, 77, 68, 69));
+    assert.equal(run(candles, seed).points.length, 4);
     const project = () => run(candles, seed).points.map(({ type, price, candleOpenTimeUnix, rangeId }) => ({ type, price, candleOpenTimeUnix, rangeId }));
     assert.deepEqual(project(), project());
   });
@@ -235,7 +260,7 @@ describe('V6 REV3 authoritative structure state machine', () => {
     assert.equal(result.activeRange, null);
   });
 
-  it('initializes from the nearest qualified warm-up cycle instead of global high/low order', () => {
+  it('initializes from the first completed external warm-up cycle instead of global high/low order', () => {
     const candles = [
       candle(0, 85, 90, 80, 86),
       candle(1, 89, 102, 88, 101),
@@ -245,8 +270,10 @@ describe('V6 REV3 authoritative structure state machine', () => {
       candle(5, 96, 97, 93, 95),
       candle(6, 95, 99, 94, 98),
     ];
+    assert.equal(detectStructureV6FibQualifiedRange(candles, { initializationSearchCandles: 8 }).points.length, 0);
+    candles.push(candle(7, 98, 105, 97, 103)); // first actual expansion confirmation
     const result = detectStructureV6FibQualifiedRange(candles, {
-      initializationSearchCandles: 7,
+      initializationSearchCandles: 8,
       minimumRetracementCandles: 4,
       minimumRetracementFib: 0.382,
     });

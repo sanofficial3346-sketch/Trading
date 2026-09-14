@@ -52,7 +52,6 @@ interface CandidateLeg {
   retracement: Extreme | null;
   retracementCandles: number;
   qualificationReachedAtIndex: number | null;
-  resumptionLevel: number | null;
 }
 
 interface ProposedTransition {
@@ -68,6 +67,7 @@ interface ProposedTransition {
   fibRequiredPrice: number;
   requiredRetracementCandles: number;
   requiredRetracementFib: number;
+  fibAnchorPrice: number;
 }
 
 interface InitializationCandidate {
@@ -141,16 +141,22 @@ export function detectStructureV6FibQualifiedRange(
   const initializationLogs: string[] = [];
 
   if (customParams?.manualStart) {
-    sequence = 1;
-    const seed = seedManualRange(customParams.manualStart, candles, symbol, timeframe, algorithmVersion, sequence);
-    activeRange = seed.range;
-    points.push(...seed.points);
-    ranges.push(seed.range);
-    engineState = seed.range.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH';
-    loopStart = Math.max(0, Math.max(seed.range.top.candleIndex ?? 0, seed.range.bottom.candleIndex ?? 0) + 1);
-    initializationLogs.push(`Manual ${seed.range.direction} range accepted.`);
+    const seed = seedManualRange(customParams.manualStart, candles, symbol, timeframe, algorithmVersion, 1);
+    if (seed) {
+      sequence = 1;
+      activeRange = seed.range;
+      points.push(...seed.points);
+      ranges.push(seed.range);
+      engineState = seed.range.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH';
+      loopStart = Math.max(seed.range.top.candleIndex ?? 0, seed.range.bottom.candleIndex ?? 0) + 1;
+      stampConfirmation(seed, candles[loopStart - 1], loopStart - 1);
+      initializationLogs.push(`Manual ${seed.range.direction} range accepted.`);
+    } else {
+      loopStart = candles.length;
+      initializationLogs.push('Manual anchors are not both present as closed candles; waiting without inventing a range.');
+    }
   } else {
-    const initialization = findNearestQualifiedWarmUpCycle(
+    const initialization = findFirstCompletedWarmUpCycle(
       candles.slice(0, warmUpCount),
       minimumRetracementCandles,
       minimumRetracementFib
@@ -169,12 +175,17 @@ export function detectStructureV6FibQualifiedRange(
         initialization.fibDepth,
         true
       );
+      stampConfirmation(seed, candles[initialization.confirmationIndex], initialization.confirmationIndex);
       activeRange = seed.range;
       points.push(...seed.points);
       ranges.push(seed.range);
       engineState = initialization.direction === 'BULLISH' ? 'RANGE_LOCKED_BULLISH' : 'RANGE_LOCKED_BEARISH';
       loopStart = initialization.confirmationIndex + 1;
-      initializationLogs.push(`Nearest qualified ${initialization.direction} warm-up cycle confirmed.`);
+      const next = detectBreak(activeRange, candles[initialization.confirmationIndex], initialization.confirmationIndex, rejectedEvents)!;
+      candidate = next.candidate;
+      breakEvents.push(next.event);
+      engineState = candidate.direction === 'BULLISH' ? 'EXPANDING_BULLISH' : 'EXPANDING_BEARISH';
+      initializationLogs.push(`First completed ${initialization.direction} external cycle seeded; replaying forward to preserve parent-range history.`);
     } else {
       loopStart = warmUpCount;
       initializationLogs.push('No qualified prior cycle found; engine remains UNINITIALIZED.');
@@ -203,7 +214,10 @@ export function detectStructureV6FibQualifiedRange(
   };
 
   for (let i = 0; i < loopStart && i < candles.length; i++) {
-    recordReplay(candleReplaySteps, i, candles[i], engineState, activeRange, ['Warm-up evaluation.'], null, null);
+    // The completed seed cannot be visible before its confirmation candle.
+    const seedConfirmed = activeRange !== null && i === loopStart - 1;
+    recordReplay(candleReplaySteps, i, candles[i], seedConfirmed ? engineState : 'UNINITIALIZED', seedConfirmed ? activeRange : null,
+      [seedConfirmed ? 'Completed seed confirmed.' : 'Warm-up evaluation; no confirmed range yet.'], seedConfirmed ? candidate?.breakEvent.id ?? null : null, seedConfirmed ? points[0].id : null);
   }
 
   for (let i = loopStart; i < candles.length; i++) {
@@ -237,34 +251,23 @@ export function detectStructureV6FibQualifiedRange(
       if (!candidate || !activeRange) {
         throw new Error('V6 invariant failure: expansion/retracement state requires a candidate and range.');
       }
-      const extended = extendCandidate(candidate, candle, i);
-      if (extended) {
+      // Parent boundaries remain authoritative even while a candidate is pending.
+      const oppositeParentBreak = candidate.direction === 'BULLISH'
+        ? candle.close < activeRange.bottom.price
+        : candle.close > activeRange.top.price;
+      if (oppositeParentBreak) {
+        const reversal = detectBreak(activeRange, candle, i, rejectedEvents)!;
+        candidate = reversal.candidate;
+        breakEvents.push(reversal.event);
+        breakThisCandle = reversal.event.id ?? null;
         engineState = candidate.direction === 'BULLISH' ? 'EXPANDING_BULLISH' : 'EXPANDING_BEARISH';
-        trace.push(`Same-leg ${candidate.direction} extreme extended to ${candidate.extreme.price}.`);
-        eventLogs.push(logItem(candle, 'LEG_EXTENDED', 'Candidate extended', trace[trace.length - 1]));
+        trace.push(`Pending candidate cancelled by ${reversal.event.breakType} through the confirmed parent boundary.`);
+        eventLogs.push(logItem(candle, 'STRUCTURE_BROKEN', 'Parent boundary broken', trace[trace.length - 1]));
       } else {
-        const retracementExtended = updateRetracement(candidate, candle, i);
-        if (retracementExtended) {
-          candidate.qualificationReachedAtIndex = null;
-          candidate.resumptionLevel = candidate.direction === 'BULLISH' ? candle.high : candle.low;
-        }
-        engineState = candidate.direction === 'BULLISH' ? 'RETRACING_BULLISH' : 'RETRACING_BEARISH';
+        // Check the PREVIOUS expansion extreme and qualification before this
+        // candle's wick can extend/reset the leg. A micro resumption is irrelevant.
         const qualification = qualify(candidate, minimumRetracementCandles, minimumRetracementFib);
-        trace.push(
-          `Retracement ${qualification.candleCount}/${minimumRetracementCandles} candles, ${(qualification.fibDepth * 100).toFixed(1)}%/${(minimumRetracementFib * 100).toFixed(1)}% Fib.`
-        );
-        const fullyQualified = qualification.candleQualified && qualification.fibQualified;
-        if (fullyQualified && candidate.qualificationReachedAtIndex === null) {
-          candidate.qualificationReachedAtIndex = i;
-          trace.push('Retracement gates satisfied; waiting for body-close resumption before locking the new external range.');
-        }
-        const resumed = candidate.resumptionLevel !== null
-          && candidate.qualificationReachedAtIndex !== null
-          && i > candidate.qualificationReachedAtIndex
-          && (candidate.direction === 'BULLISH'
-            ? candle.close > candidate.resumptionLevel
-            : candle.close < candidate.resumptionLevel);
-        if (fullyQualified && resumed && candidate.retracement) {
+        if (canConfirmExpansion(candidate, candle, i, qualification) && candidate.retracement) {
           const proposed = proposeTransition(
             activeRange,
             candidate,
@@ -276,13 +279,14 @@ export function detectStructureV6FibQualifiedRange(
             qualification
           );
           validateTransition(proposed, candle, symbol, timeframe, ranges);
+          stampConfirmation({ points: proposed.proposedPoints, range: proposed.proposedRange }, candle, i);
 
-          // Atomic commit: all derived values were validated before shared state changes.
+          // Atomic commit: the old range persists until this confirmation close.
           const brokenPrevious: StructuralRange = {
             ...proposed.previousRange,
             status: proposed.breakEvent.breakType.includes('STRUCTURE_BROKEN') ? 'BROKEN_REVERSAL' : 'BROKEN_CONTINUATION',
-            endedAt: proposed.breakEvent.candleTime,
-            endedAtUnix: proposed.breakEvent.candleTimeUnix,
+            endedAt: candle.openTime,
+            endedAtUnix: candle.openTimeUnix,
             breakEventId: proposed.breakEvent.id,
             breakCandleTime: proposed.breakEvent.candleTime,
             breakCandleClose: proposed.breakEvent.price,
@@ -296,9 +300,31 @@ export function detectStructureV6FibQualifiedRange(
           sequence++;
           audits.push(...createAudits(proposed, algorithmVersion));
           confirmedThisCandle = proposed.proposedPoints[0].id;
+          trace.push(`Close ${candle.close} crossed the prior candidate expansion ${candidate.extreme.price}; committed ${proposed.proposedPoints.map((point) => point.type).join('+')} atomically.`);
           eventLogs.push(logItem(candle, 'STRUCTURE_CONFIRMED', `${candidate.direction} cycle confirmed`, trace[trace.length - 1]));
-          trace.push(`Committed ${proposed.proposedPoints.map((point) => point.type).join('+')} atomically.`);
-          candidate = null;
+
+          // The confirming candle is already outside the newly confirmed range.
+          // Carry its wick into the next leg; never lose it or confirm twice.
+          const next = detectBreak(activeRange, candle, i, rejectedEvents)!;
+          candidate = next.candidate;
+          breakEvents.push(next.event);
+          breakThisCandle = next.event.id ?? null;
+          engineState = candidate.direction === 'BULLISH' ? 'EXPANDING_BULLISH' : 'EXPANDING_BEARISH';
+        } else {
+          const extended = advanceUnconfirmedCandidate(candidate, candle, i, minimumRetracementCandles, minimumRetracementFib);
+          engineState = candidate.direction === 'BULLISH'
+            ? extended ? 'EXPANDING_BULLISH' : 'RETRACING_BULLISH'
+            : extended ? 'EXPANDING_BEARISH' : 'RETRACING_BEARISH';
+          if (extended) {
+            trace.push(`Same-leg ${candidate.direction} extreme extended to ${candidate.extreme.price}; retracement reset.`);
+            eventLogs.push(logItem(candle, 'LEG_EXTENDED', 'Candidate extended', trace[trace.length - 1]));
+          } else {
+            const current = qualify(candidate, minimumRetracementCandles, minimumRetracementFib);
+            trace.push(`Retracement ${current.candleCount}/${minimumRetracementCandles} candles, ${(current.fibDepth * 100).toFixed(1)}%/${(minimumRetracementFib * 100).toFixed(1)}% Fib.`);
+            if (current.candleQualified && current.fibQualified) {
+              trace.push(`Qualified candidate only; waiting for a later close through expansion extreme ${candidate.extreme.price}.`);
+            }
+          }
         }
       }
     }
@@ -360,7 +386,7 @@ export function detectStructureV6FibQualifiedRange(
   };
 }
 
-function findNearestQualifiedWarmUpCycle(
+function findFirstCompletedWarmUpCycle(
   candles: NormalizedMarketCandle[],
   minimumCandles: number,
   minimumFib: number
@@ -370,55 +396,50 @@ function findNearestQualifiedWarmUpCycle(
     const prior = candles.slice(0, breakIndex);
     const priorHigh = Math.max(...prior.map((c) => c.high));
     const priorLow = Math.min(...prior.map((c) => c.low));
-    const direction: Direction | null = candles[breakIndex].close > priorHigh
+    const breakCandle = candles[breakIndex];
+    const direction: Direction | null = breakCandle.close > priorHigh
       ? 'BULLISH'
-      : candles[breakIndex].close < priorLow
-        ? 'BEARISH'
-        : null;
+      : breakCandle.close < priorLow ? 'BEARISH' : null;
     if (!direction) continue;
 
+    // Bootstrap only from a close beyond the entire observed prefix envelope.
+    // A completed expansion/retracement/expansion is required, never four bars alone.
     const anchorPrice = direction === 'BULLISH' ? priorLow : priorHigh;
-    let extreme: Extreme = { price: direction === 'BULLISH' ? candles[breakIndex].high : candles[breakIndex].low, candle: candles[breakIndex], index: breakIndex };
-    let retracement: Extreme | null = null;
-    let qualificationReachedAtIndex: number | null = null;
-    let resumptionLevel: number | null = null;
+    const candidate: CandidateLeg = {
+      direction,
+      anchor: {
+        type: direction === 'BULLISH' ? StructurePointType.HL : StructurePointType.LH,
+        price: anchorPrice, candleTime: prior[0].openTime,
+        candleTimeUnix: prior[0].openTimeUnix, label: 'UNCONFIRMED_SEED',
+      },
+      breakEvent: {
+        candleTime: breakCandle.openTime, candleTimeUnix: breakCandle.openTimeUnix,
+        price: breakCandle.close, brokenLevel: direction === 'BULLISH' ? priorHigh : priorLow,
+        breakType: 'WARMUP', label: 'WARMUP',
+      },
+      breakCandle,
+      extreme: { price: direction === 'BULLISH' ? breakCandle.high : breakCandle.low, candle: breakCandle, index: breakIndex },
+      retracement: null, retracementCandles: 0, qualificationReachedAtIndex: null,
+    };
     for (let i = breakIndex + 1; i < candles.length; i++) {
       const candle = candles[i];
-      const isExtension = direction === 'BULLISH' ? candle.high > extreme.price : candle.low < extreme.price;
-      if (isExtension) {
-        extreme = { price: direction === 'BULLISH' ? candle.high : candle.low, candle, index: i };
-        retracement = null;
-        qualificationReachedAtIndex = null;
-        resumptionLevel = null;
-        continue;
-      }
-      if (!retracement || (direction === 'BULLISH' ? candle.low < retracement.price : candle.high > retracement.price)) {
-        retracement = { price: direction === 'BULLISH' ? candle.low : candle.high, candle, index: i };
-        qualificationReachedAtIndex = null;
-        resumptionLevel = direction === 'BULLISH' ? candle.high : candle.low;
-      }
-      const count = i - extreme.index;
-      const range = Math.abs(extreme.price - anchorPrice);
-      const depth = range > 0
-        ? direction === 'BULLISH'
-          ? (extreme.price - retracement.price) / range
-          : (retracement.price - extreme.price) / range
-        : 0;
-      const fullyQualified = count >= minimumCandles && depth >= minimumFib;
-      if (fullyQualified && qualificationReachedAtIndex === null) {
-        qualificationReachedAtIndex = i;
-      }
-      const resumed = resumptionLevel !== null
-        && qualificationReachedAtIndex !== null
-        && i > qualificationReachedAtIndex
-        && (direction === 'BULLISH' ? candle.close > resumptionLevel : candle.close < resumptionLevel);
-      if (fullyQualified && resumed) {
-        completed.push({ direction, extreme, retracement, anchorPrice, confirmationIndex: i, retracementCandles: count, fibDepth: depth });
+      // A seed that crosses its opposing prefix boundary has been invalidated.
+      if (direction === 'BULLISH' ? candle.close < priorLow : candle.close > priorHigh) break;
+      const qualification = qualify(candidate, minimumCandles, minimumFib);
+      if (canConfirmExpansion(candidate, candle, i, qualification) && candidate.retracement) {
+        completed.push({
+          direction, extreme: candidate.extreme, retracement: candidate.retracement,
+          anchorPrice, confirmationIndex: i, retracementCandles: qualification.candleCount,
+          fibDepth: qualification.fibDepth,
+        });
         break;
       }
+      advanceUnconfirmedCandidate(candidate, candle, i, minimumCandles, minimumFib);
     }
   }
-  return completed.sort((a, b) => b.confirmationIndex - a.confirmationIndex)[0] ?? null;
+  // Seed the earliest completed cycle, then let the ordinary state machine
+  // replay forward. Picking the latest independent micro-cycle loses its parent.
+  return completed.sort((a, b) => a.confirmationIndex - b.confirmationIndex)[0] ?? null;
 }
 
 function detectBreak(
@@ -472,7 +493,6 @@ function detectBreak(
       retracement: null,
       retracementCandles: 0,
       qualificationReachedAtIndex: null,
-      resumptionLevel: null,
     },
   };
 }
@@ -486,7 +506,6 @@ function extendCandidate(candidate: CandidateLeg, candle: NormalizedMarketCandle
   candidate.retracement = null;
   candidate.retracementCandles = 0;
   candidate.qualificationReachedAtIndex = null;
-  candidate.resumptionLevel = null;
   return true;
 }
 
@@ -499,6 +518,24 @@ function updateRetracement(candidate: CandidateLeg, candle: NormalizedMarketCand
   }
   candidate.retracementCandles = index - candidate.extreme.index;
   return extended;
+}
+
+function canConfirmExpansion(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number, qualification: ReturnType<typeof qualify>): boolean {
+  return candle.isClosed === true
+    && candidate.qualificationReachedAtIndex !== null
+    && index > candidate.qualificationReachedAtIndex
+    && qualification.candleQualified && qualification.fibQualified
+    && (candidate.direction === 'BULLISH' ? candle.close > candidate.extreme.price : candle.close < candidate.extreme.price);
+}
+
+function advanceUnconfirmedCandidate(candidate: CandidateLeg, candle: NormalizedMarketCandle, index: number, minimumCandles: number, minimumFib: number): boolean {
+  if (extendCandidate(candidate, candle, index)) return true;
+  updateRetracement(candidate, candle, index);
+  const qualification = qualify(candidate, minimumCandles, minimumFib);
+  if (qualification.candleQualified && qualification.fibQualified && candidate.qualificationReachedAtIndex === null) {
+    candidate.qualificationReachedAtIndex = index;
+  }
+  return false;
 }
 
 function qualify(candidate: CandidateLeg, requiredCandles: number, requiredFib: number) {
@@ -558,6 +595,7 @@ function proposeTransition(
     fibRequiredPrice: qualification.fibRequiredPrice,
     requiredRetracementCandles: qualification.requiredCandles,
     requiredRetracementFib: qualification.requiredFib,
+    fibAnchorPrice: candidate.anchor.price,
   };
 }
 
@@ -632,7 +670,7 @@ function makePoint(
     retracementCandles,
     retracementFibDepth: fibDepth,
     isWarmUpAnchor: warmUp,
-    confirmationReason: warmUp ? 'Nearest qualified prior warm-up cycle.' : 'Body-close break followed by candle-count and wick-Fibonacci qualified retracement.',
+    confirmationReason: warmUp ? 'Completed prior external cycle (or explicit manual seed).' : 'External body-close break, qualified retracement, then a later close through the preceding expansion extreme.',
     detectedAt: new Date(0).toISOString(),
     createdAt: new Date(0).toISOString(),
   };
@@ -651,6 +689,17 @@ function pointToAnchor(point: StructurePoint): TypedStructuralAnchor<StructurePo
   };
 }
 
+function stampConfirmation(pair: { points: [StructurePoint, StructurePoint]; range: StructuralRange }, candle: NormalizedMarketCandle, index: number): void {
+  for (const point of pair.points) {
+    point.confirmationCandleTime = candle.openTime;
+    point.confirmationCandleTimeUnix = candle.openTimeUnix;
+    point.confirmationCandleIndex = index;
+  }
+  // Range lifetime begins when it is confirmed, not at the historical wick.
+  pair.range.startedAt = candle.openTime;
+  pair.range.startedAtUnix = candle.openTimeUnix;
+}
+
 function seedManualRange(
   manual: NonNullable<StructureParameters['manualStart']>,
   candles: NormalizedMarketCandle[],
@@ -658,15 +707,17 @@ function seedManualRange(
   timeframe: string,
   algorithmVersion: string,
   sequence: number
-): { points: [StructurePoint, StructurePoint]; range: BullishRange | BearishRange } {
-  const locate = (value: typeof manual.top, fallback: number): Extreme => {
+): { points: [StructurePoint, StructurePoint]; range: BullishRange | BearishRange } | null {
+  const locate = (value: typeof manual.top): Extreme | null => {
     const unix = value.candleTimeUnix ?? new Date(value.candleTime).getTime();
-    const index = value.candleIndex ?? candles.findIndex((c) => c.openTimeUnix === unix);
-    const candle = candles[index >= 0 ? index : fallback] ?? candles[0];
-    return { price: value.price, candle: { ...candle, openTime: value.candleTime, openTimeUnix: unix }, index: index >= 0 ? index : fallback };
+    // Array indices can shift after filtering an open candle or slicing a window.
+    // Anchor identity comes from its timestamp, never a guessed fallback candle.
+    const index = candles.findIndex((c) => c.openTimeUnix === unix);
+    return index < 0 ? null : { price: value.price, candle: candles[index], index };
   };
-  const top = locate(manual.top, 0);
-  const bottom = locate(manual.bottom, 1);
+  const top = locate(manual.top);
+  const bottom = locate(manual.bottom);
+  if (!top || !bottom || top.index === bottom.index) return null;
   return manual.direction === 'BULLISH'
     ? createQualifiedPair('BULLISH', top, bottom, symbol, timeframe, algorithmVersion, sequence, 0, 0, true)
     : createQualifiedPair('BEARISH', bottom, top, symbol, timeframe, algorithmVersion, sequence, 0, 0, true);
@@ -698,7 +749,10 @@ function validateTransition(
         ? proposed.breakEvent.price > proposed.previousRange.top.price
         : proposed.breakEvent.price < proposed.previousRange.bottom.price;
   if (!proposed.breakEvent.id || !breakCloseQualified || confirmingCandle.isClosed !== true) throw new Error('V6 invariant failure: transition requires a closed-candle body break.');
-  if (proposed.retracementCandles < proposed.requiredRetracementCandles || proposed.fibDepth < proposed.requiredRetracementFib) throw new Error('V6 invariant failure: retracement was not qualified.');
+  const expansionConfirmed = bullish ? confirmingCandle.close > proposed.candidateExtreme.price : confirmingCandle.close < proposed.candidateExtreme.price;
+  if (!expansionConfirmed || confirmingCandle.openTimeUnix <= proposed.retracementExtreme.candle.openTimeUnix) throw new Error('V6 invariant failure: later close must cross the preceding expansion extreme.');
+  const fibQualified = bullish ? proposed.retracementExtreme.price <= proposed.fibRequiredPrice : proposed.retracementExtreme.price >= proposed.fibRequiredPrice;
+  if (proposed.retracementCandles < proposed.requiredRetracementCandles || !fibQualified) throw new Error('V6 invariant failure: retracement was not qualified.');
   if (extreme.symbol !== symbol || retracement.symbol !== symbol || extreme.timeframe !== timeframe || retracement.timeframe !== timeframe) throw new Error('V6 invariant failure: symbol/timeframe mismatch.');
   if (extreme.eventId === retracement.eventId || extreme.candleOpenTimeUnix === retracement.candleOpenTimeUnix) throw new Error('V6 invariant failure: opposing types share one event.');
 }
@@ -713,10 +767,14 @@ function validateFinalState(points: StructurePoint[], ranges: StructuralRange[],
     throw new Error('V6 invariant failure: undefined state cannot own an active range.');
   }
   const events = new Set<string>();
+  const classifications = new Map<number, StructurePointType>();
   for (const point of points) {
     const key = point.eventId ?? point.id;
     if (events.has(key)) throw new Error(`V6 invariant failure: duplicate event ${key}.`);
     events.add(key);
+    const existing = classifications.get(point.candleOpenTimeUnix);
+    if (existing !== undefined && existing !== point.type) throw new Error('V6 invariant failure: opposing types share one candle.');
+    classifications.set(point.candleOpenTimeUnix, point.type);
   }
 }
 
@@ -761,7 +819,7 @@ function createAudits(proposed: ProposedTransition, algorithmVersion: string): S
     retracementCandleCount: proposed.retracementCandles,
     requiredRetracementCandles: proposed.requiredRetracementCandles,
     candleCountQualified: true,
-    fibAnchorPrice: proposed.previousRange.direction === 'BULLISH' ? proposed.previousRange.bottom.price : proposed.previousRange.top.price,
+    fibAnchorPrice: proposed.fibAnchorPrice,
     fibExtremePrice: proposed.candidateExtreme.price,
     fibRequiredRatio: proposed.requiredRetracementFib,
     fibRequiredPrice: proposed.fibRequiredPrice,
