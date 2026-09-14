@@ -353,6 +353,11 @@ export interface StructurePoint {
   cycleNumber?: number; // 1, 2, 3...
   isWarmUpAnchor?: boolean; // Was established during warm-up initialization
   confirmed?: boolean;
+  // Swing location stays in candleOpenTime; this is the later CLOSED candle
+  // on which the pair became knowable. Times identify that candle's open.
+  confirmationCandleTime?: string;
+  confirmationCandleTimeUnix?: number;
+  confirmationCandleIndex?: number;
   structureScope?: 'EXTERNAL' | 'INTERNAL';
   eventId?: string;
   parameters?: Record<string, unknown> | StructureParameters | any;
